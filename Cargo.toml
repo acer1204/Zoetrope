@@ -1,0 +1,45 @@
+[package]
+name = "zoetrope"
+version = "0.1.0"
+edition = "2021"
+description = "走馬燈 — 極速跨平台看圖軟體：GPU 渲染、串流動畫解碼、資料夾惰性載入"
+license = "AGPL-3.0-only"
+repository = "https://github.com/acer1204/Zoetrope"
+readme = "README.md"
+keywords = ["image", "viewer", "gpu", "animation", "gif"]
+categories = ["multimedia::images"]
+
+[dependencies]
+eframe = { version = "0.29", features = ["wgpu", "persistence"] }
+image = { version = "0.25", default-features = false, features = [
+    "rayon",
+    "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg",
+    "png", "pnm", "qoi", "tga", "tiff", "webp",
+] }
+crossbeam-channel = "0.5"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+
+# 額外格式解碼器（全部純 Rust，免 C 相依）
+jxl-oxide = "0.12"                                  # JPEG XL
+heic = { version = "0.1", features = ["av1"] }      # HEIC/HEIF（HEVC）+ AVIF
+rawloader = "0.37"                                  # 相機 RAW：CR2/NEF/ARW/DNG…
+imagepipe = "0.5"                                   # RAW → sRGB 影像管線
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+# 僅測試用：產生真實 AVIF 樣本以驗證解碼路徑（純 Rust 編碼器）
+[dev-dependencies]
+ravif = "0.11"
+rgb = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# 開發時讓相依套件也用最佳化編譯（影像解碼在 debug 模式下會慢到不可用）
+[profile.dev.package."*"]
+opt-level = 2

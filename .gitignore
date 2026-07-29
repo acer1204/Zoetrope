@@ -1,0 +1,15 @@
+/target
+/samples
+Cargo.lock.orig
+
+# 本機建置設定（含機器專屬的絕對路徑，不應進版控）
+/.cargo/config.toml
+
+# 建置產物
+/Zoetrope.exe
+/zoetrope
+*.old.exe
+
+# 測試樣本檔（自行放入，不納入版控；說明見 tests/assets/README.md）
+/tests/assets/*
+!/tests/assets/README.md
