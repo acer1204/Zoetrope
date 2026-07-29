@@ -167,7 +167,10 @@ fn worker_loop(
                 }
                 let r = catch_unwind(AssertUnwindSafe(|| decode_prefetch(&path)));
                 if let Ok(Ok(decoded)) = r {
-                    cache.lock().unwrap().insert(path.clone(), Arc::new(decoded));
+                    cache
+                        .lock()
+                        .unwrap()
+                        .insert(path.clone(), Arc::new(decoded));
                     send(LoadEvent::Prefetched { path });
                 }
                 // 預載失敗不回報：使用者真的翻到那張時會以高優先權重試並顯示錯誤
@@ -241,7 +244,15 @@ fn decode_streaming(
     let kind = sniff_animation_kind(path, &ext);
     if let Some((frames_iter, dims, fmt)) = open_animation(path, &kind)? {
         decode_animation(
-            path, file_size, dims, fmt, frames_iter, true, generation, latest_gen, send,
+            path,
+            file_size,
+            dims,
+            fmt,
+            frames_iter,
+            true,
+            generation,
+            latest_gen,
+            send,
         )
     } else {
         let (rgba, fmt) = decode_static(path)?;
@@ -298,7 +309,15 @@ fn decode_prefetch(path: &Path) -> Result<Decoded, String> {
     if let Some((frames_iter, dims, fmt)) = open_animation(path, &kind)? {
         let never = AtomicU64::new(u64::MAX); // 不會被作廢
         decode_animation(
-            path, file_size, dims, fmt, frames_iter, false, u64::MAX, &never, &ignore,
+            path,
+            file_size,
+            dims,
+            fmt,
+            frames_iter,
+            false,
+            u64::MAX,
+            &never,
+            &ignore,
         )
     } else {
         let (rgba, fmt) = decode_static(path)?;
@@ -619,10 +638,7 @@ mod tests {
 
     #[test]
     fn mip_chain_dims() {
-        let base = Arc::new(ColorImage::new(
-            [4000, 3000],
-            eframe::egui::Color32::WHITE,
-        ));
+        let base = Arc::new(ColorImage::new([4000, 3000], eframe::egui::Color32::WHITE));
         let mips = build_mips(base);
         assert_eq!(mips[0].size, [4000, 3000]);
         assert_eq!(mips[1].size, [2000, 1500]);

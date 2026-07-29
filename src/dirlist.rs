@@ -5,8 +5,8 @@ use crate::types::FileEntry;
 
 /// image crate 直接支援的副檔名
 pub const BASE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "jpe", "jfif", "png", "apng", "gif", "webp", "bmp", "dib", "ico", "tif",
-    "tiff", "tga", "qoi", "hdr", "exr", "pnm", "pbm", "pgm", "ppm", "dds", "ff",
+    "jpg", "jpeg", "jpe", "jfif", "png", "apng", "gif", "webp", "bmp", "dib", "ico", "tif", "tiff",
+    "tga", "qoi", "hdr", "exr", "pnm", "pbm", "pgm", "ppm", "dds", "ff",
 ];
 
 /// 全部支援的副檔名（含 JPEG XL / AVIF / HEIC / RAW），
@@ -208,8 +208,14 @@ mod tests {
     #[test]
     fn ext_filter_includes_modern_and_raw() {
         for name in [
-            "pic.jxl", "pic.avif", "IMG_1234.HEIC", "IMG_1234.heif", "shot.CR2", "shot.nef",
-            "shot.arw", "shot.dng",
+            "pic.jxl",
+            "pic.avif",
+            "IMG_1234.HEIC",
+            "IMG_1234.heif",
+            "shot.CR2",
+            "shot.nef",
+            "shot.arw",
+            "shot.dng",
         ] {
             assert!(is_image_path(Path::new(name)), "應辨識 {name}");
         }

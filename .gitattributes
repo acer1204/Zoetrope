@@ -1,0 +1,12 @@
+# 統一換行：版本庫內一律 LF，避免跨平台協作時整檔 diff
+* text=auto eol=lf
+
+# PowerShell 腳本在 Windows 上以 CRLF 使用較穩妥
+*.ps1 text eol=crlf
+
+# 二進位檔不做任何轉換
+*.png binary
+*.ico binary
+*.jpg binary
+*.gif binary
+*.webp binary

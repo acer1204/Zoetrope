@@ -1,5 +1,9 @@
 # Zoetrope 走馬燈
 
+[![CI](https://github.com/acer1204/Zoetrope/actions/workflows/ci.yml/badge.svg)](https://github.com/acer1204/Zoetrope/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
+
 **極速跨平台看圖軟體** — 以 Rust + egui + wgpu 打造。
 
 專注一件事：**看圖要夠流暢**。開檔即開窗、大 GIF 秒播、萬張資料夾翻頁不卡、
@@ -7,6 +11,13 @@
 Windows / macOS / Linux 同一套程式碼。
 
 > 名稱取自 19 世紀讓靜止畫面轉動起來的視覺裝置「走馬燈」（zoetrope）。
+
+![Zoetrope 主畫面](docs/screenshot-photo.png)
+
+<p align="center">
+  <img src="docs/screenshot-anim.png" width="88%" alt="動畫串流解碼：解出第一格立即播放，狀態列顯示解碼進度"><br>
+  <sub>動畫串流解碼——第一格解出就開始播放，其餘影格邊解邊進（工具列顯示 142/150）</sub>
+</p>
 
 ## 特色
 
@@ -26,6 +37,11 @@ Windows / macOS / Linux 同一套程式碼。
   以及 **JPEG XL、AVIF、HEIC/HEIF、相機 RAW**（CR2/NEF/ARW/DNG…）——
   全部純 Rust 解碼，**不需要安裝任何 C 函式庫或系統擴充功能**
 - **內容偵測**：以檔頭判斷真實格式，副檔名標錯（例如 JPEG 存成 `.png`）也能正常開啟
+
+## 安裝
+
+到 [Releases](https://github.com/acer1204/Zoetrope/releases) 下載編譯好的執行檔，
+或依下方說明自行建置。
 
 ## 建置
 

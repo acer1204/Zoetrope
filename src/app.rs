@@ -50,7 +50,6 @@ impl ZoomMode {
             ZoomMode::Free => "自訂",
         }
     }
-
 }
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -343,10 +342,7 @@ impl ViewerApp {
 
     /// 載入中的新圖已有可畫的影格 → 取代畫面上的舊圖
     fn promote_if_ready(&mut self, ctx: &Context) {
-        let ready = self
-            .incoming
-            .as_ref()
-            .is_some_and(|c| !c.frames.is_empty());
+        let ready = self.incoming.as_ref().is_some_and(|c| !c.frames.is_empty());
         if ready {
             let img = self.incoming.take().unwrap();
             self.show(img);
@@ -934,7 +930,7 @@ impl ViewerApp {
                 if steps != 0 {
                     // nav 之後照常往下畫（此時 self.current 已是新圖或維持舊圖），
                     // 不能提早 return，否則這一幀會是空白 → 視覺上閃爍
-                    self.nav(&ctx, steps as isize);
+                    self.nav(&ctx, steps);
                 }
             }
         }
@@ -965,8 +961,7 @@ impl ViewerApp {
         let zoom = self.effective_zoom(rect.size(), ppp);
 
         // --- 互動：拖曳平移 / 滾輪縮放 / 雙擊切換 ---
-        if response.dragged_by(PointerButton::Primary)
-            || response.dragged_by(PointerButton::Middle)
+        if response.dragged_by(PointerButton::Primary) || response.dragged_by(PointerButton::Middle)
         {
             // Fit 模式圖片必定完整可見，多餘位移由 clamp_pan 夾回
             self.pan += response.drag_delta();
@@ -1123,11 +1118,7 @@ impl ViewerApp {
             let img = cur.frames[fi].image.clone();
             match &mut cur.tex.anim {
                 None => {
-                    let tex = ctx.load_texture(
-                        "anim",
-                        egui::ImageData::Color(img),
-                        opts(nearest),
-                    );
+                    let tex = ctx.load_texture("anim", egui::ImageData::Color(img), opts(nearest));
                     cur.tex.anim_frame = fi;
                     cur.tex.anim_nearest = nearest;
                     cur.tex.anim = Some(tex);
@@ -1192,11 +1183,9 @@ impl ViewerApp {
             egui::FontId::proportional(13.0),
             ui.visuals().weak_text_color().gamma_multiply(0.7),
         );
-        let btn_rect = Rect::from_center_size(rect.center() + Vec2::new(0.0, 36.0), Vec2::new(150.0, 34.0));
-        if ui
-            .put(btn_rect, egui::Button::new("開啟圖片…"))
-            .clicked()
-        {
+        let btn_rect =
+            Rect::from_center_size(rect.center() + Vec2::new(0.0, 36.0), Vec2::new(150.0, 34.0));
+        if ui.put(btn_rect, egui::Button::new("開啟圖片…")).clicked() {
             let ctx = ui.ctx().clone();
             self.open_dialog(&ctx);
         }
@@ -1246,7 +1235,9 @@ impl ViewerApp {
                 self.loading_path.as_ref().map(|p| {
                     format!(
                         "讀取中… {}",
-                        p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                        p.file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default()
                     )
                 })
             })
@@ -1274,7 +1265,11 @@ impl ViewerApp {
                 let mut act_play = false;
                 let mut act_full = false;
 
-                if ui.button("開啟").on_hover_text("開啟圖片 (Ctrl+O / O)").clicked() {
+                if ui
+                    .button("開啟")
+                    .on_hover_text("開啟圖片 (Ctrl+O / O)")
+                    .clicked()
+                {
                     act_open = true;
                 }
                 ui.separator();
@@ -1330,7 +1325,11 @@ impl ViewerApp {
                 .on_hover_text(format!(
                     "排序：{} · {}（S 鍵快速切換升降序）",
                     self.prefs.sort_key.name(),
-                    if self.prefs.sort_asc { "升序" } else { "降序" }
+                    if self.prefs.sort_asc {
+                        "升序"
+                    } else {
+                        "降序"
+                    }
                 ));
                 if sort_changed {
                     self.apply_sort();
@@ -1359,12 +1358,13 @@ impl ViewerApp {
                     }
                 })
                 .response
-                .on_hover_text(format!(
-                    "顯示方式：{}（快捷鍵 0/W/H/1）",
-                    self.mode.name()
-                ));
+                .on_hover_text(format!("顯示方式：{}（快捷鍵 0/W/H/1）", self.mode.name()));
                 ui.separator();
-                if ui.button("⟲").on_hover_text("逆時針旋轉 (Shift+R)").clicked() {
+                if ui
+                    .button("⟲")
+                    .on_hover_text("逆時針旋轉 (Shift+R)")
+                    .clicked()
+                {
                     act_rot_ccw = true;
                 }
                 if ui.button("⟳").on_hover_text("順時針旋轉 (R)").clicked() {
@@ -1375,7 +1375,11 @@ impl ViewerApp {
                 if animated {
                     ui.separator();
                     let label = if self.playing { "⏸" } else { "▶" };
-                    if ui.button(label).on_hover_text("播放／暫停 (Space)").clicked() {
+                    if ui
+                        .button(label)
+                        .on_hover_text("播放／暫停 (Space)")
+                        .clicked()
+                    {
                         act_play = true;
                     }
                     if let Some(c) = &self.current {
@@ -1579,6 +1583,21 @@ fn wheel_steps(accum: &mut f32, delta: f32) -> isize {
     steps
 }
 
+fn fmt_bytes(b: usize) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    let mut v = b as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u + 1 < UNITS.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::wheel_steps;
@@ -1620,20 +1639,5 @@ mod tests {
         assert_eq!(wheel_steps(&mut acc, -30.0), 0);
         assert_eq!(wheel_steps(&mut acc, 30.0), 0);
         assert!(acc.abs() < 0.001);
-    }
-}
-
-fn fmt_bytes(b: usize) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
-    let mut v = b as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u + 1 < UNITS.len() {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{b} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
     }
 }

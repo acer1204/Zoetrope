@@ -74,7 +74,10 @@ fn install_cjk_fonts(ctx: &egui::Context) {
             ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
             ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 0),
             ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
-            ("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0),
+            (
+                "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+                0,
+            ),
         ]
     };
     for (path, index) in candidates {

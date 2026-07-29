@@ -55,9 +55,7 @@ fn scan_decode_roundtrip() {
     let (frames, dims, fmt) = anim.expect("gif 應判定為動畫");
     assert_eq!(dims, (64, 48));
     assert_eq!(fmt, "GIF");
-    let frames: Vec<_> = frames
-        .collect::<Result<Vec<_>, _>>()
-        .expect("gif 影格解碼");
+    let frames: Vec<_> = frames.collect::<Result<Vec<_>, _>>().expect("gif 影格解碼");
     assert_eq!(frames.len(), 8);
     for f in &frames {
         let buf = f.buffer();

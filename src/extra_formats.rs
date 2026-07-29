@@ -132,8 +132,8 @@ fn decode_heif(path: &Path, fmt: ExtraFormat) -> Result<RgbaImage, String> {
 
 fn decode_raw(path: &Path) -> Result<RgbaImage, String> {
     // 0,0 = 不限制輸出尺寸（完整解析度）
-    let srgb = imagepipe::simple_decode_8bit(path, 0, 0)
-        .map_err(|e| format!("RAW 解碼失敗：{e}"))?;
+    let srgb =
+        imagepipe::simple_decode_8bit(path, 0, 0).map_err(|e| format!("RAW 解碼失敗：{e}"))?;
     let (w, h) = (srgb.width, srgb.height);
     if w == 0 || h == 0 || srgb.data.len() < w * h * 3 {
         return Err("RAW 影像資料無效".into());
@@ -181,8 +181,14 @@ mod tests {
 
     #[test]
     fn detects_avif_and_heic_brands() {
-        assert_eq!(detect(&p("x.avif"), &ftyp(b"avif")), Some(ExtraFormat::Avif));
-        assert_eq!(detect(&p("x.avif"), &ftyp(b"avis")), Some(ExtraFormat::Avif));
+        assert_eq!(
+            detect(&p("x.avif"), &ftyp(b"avif")),
+            Some(ExtraFormat::Avif)
+        );
+        assert_eq!(
+            detect(&p("x.avif"), &ftyp(b"avis")),
+            Some(ExtraFormat::Avif)
+        );
         for brand in [b"heic", b"heix", b"mif1", b"msf1"] {
             assert_eq!(
                 detect(&p("IMG_0001.heic"), &ftyp(brand)),

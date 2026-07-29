@@ -96,7 +96,9 @@ pub enum LoadEvent {
         message: String,
     },
     /// 預載完成（UI 若正好在等這張圖可直接採用快取）
-    Prefetched { path: PathBuf },
+    Prefetched {
+        path: PathBuf,
+    },
     /// 資料夾掃描結果（未排序；UI 依目前排序設定重排）
     DirListing {
         generation: u64,
