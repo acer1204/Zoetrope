@@ -241,7 +241,19 @@ fn decode_streaming(
         });
     }
 
+    // RAW 走漸進式：先送內嵌預覽讓畫面立刻出現，必要時再補完整顯影
+    if crate::extra_formats::sniff(path) == Some(crate::extra_formats::ExtraFormat::Raw) {
+        return decode_raw_progressive(path, file_size, generation, latest_gen, send);
+    }
+
     let kind = sniff_animation_kind(path, &ext);
+    // 大 JPEG 走漸進式：先以 DCT 縮放解出低解析度版本，再補全解析度
+    if kind.is_empty() && is_jpeg_file(path) {
+        if let Some(d) = decode_jpeg_progressive(path, file_size, generation, latest_gen, send) {
+            return d;
+        }
+    }
+
     if let Some((frames_iter, dims, fmt)) = open_animation(path, &kind)? {
         decode_animation(
             path,
@@ -300,6 +312,254 @@ fn decode_streaming(
     }
 }
 
+/// 漸進式第一階段要達到的最長邊。
+/// 實測 6000×4000 的 JPEG：全解 223ms、1/2 101ms、1/4 58ms、1/8 46ms——
+/// 1/4 之後收益遞減（Huffman 解碼那段省不掉），因此取能落在 1/4 的門檻。
+const JPEG_FAST_TARGET: u32 = 1200;
+
+/// 小於這個像素數的 JPEG 全解本來就夠快，多跑一次縮放解碼反而是浪費
+const JPEG_PROGRESSIVE_MIN_PIXELS: u64 = 6_000_000;
+
+fn is_jpeg_file(path: &Path) -> bool {
+    ImageReader::open(path)
+        .ok()
+        .and_then(|r| r.with_guessed_format().ok())
+        .and_then(|r| r.format())
+        == Some(image::ImageFormat::Jpeg)
+}
+
+/// 送出一張影像的完整事件組（Meta → Frame → Mips）。
+/// `orig_size` 是「這張圖在原始檔案中的像素尺寸」——漸進式的低解析度階段
+/// 仍要回報全解析度，縮放比例顯示與 mip 選層才會正確、畫面也不會跳動。
+fn emit_static(
+    path: &Path,
+    rgba: RgbaImage,
+    orig_size: [u32; 2],
+    file_size: u64,
+    format: &str,
+    generation: u64,
+    send: &dyn Fn(LoadEvent),
+) -> (ImageMeta, FrameData, Vec<Arc<ColorImage>>) {
+    let has_alpha = rgba_has_alpha(&rgba);
+    let meta = ImageMeta {
+        path: path.to_path_buf(),
+        orig_size,
+        file_size,
+        format: format.to_owned(),
+        animated: false,
+        has_alpha,
+    };
+    send(LoadEvent::Meta {
+        generation,
+        meta: meta.clone(),
+    });
+    let base = Arc::new(to_color_image_clamped(rgba));
+    let frame = FrameData {
+        image: base.clone(),
+        delay: Duration::ZERO,
+    };
+    send(LoadEvent::Frame {
+        generation,
+        index: 0,
+        frame: frame.clone(),
+    });
+    let mips = build_mips(base);
+    send(LoadEvent::Mips {
+        generation,
+        mips: mips.clone(),
+    });
+    (meta, frame, mips)
+}
+
+/// 大 JPEG 的漸進式解碼：
+/// 1. 以 DCT 係數縮放解出約 `JPEG_FAST_TARGET` 大小的版本 → 立即顯示
+/// 2. 再解全解析度 → 取代同一格
+///
+/// 回傳 None 代表這張不適合漸進式（尺寸不夠大或標頭讀不到），
+/// 呼叫端應走一般路徑。
+fn decode_jpeg_progressive(
+    path: &Path,
+    file_size: u64,
+    generation: u64,
+    latest_gen: &AtomicU64,
+    send: &dyn Fn(LoadEvent),
+) -> Option<Result<Decoded, String>> {
+    let (fw, fh) = crate::jpeg_fast::dimensions(path)?;
+    if u64::from(fw) * u64::from(fh) < JPEG_PROGRESSIVE_MIN_PIXELS {
+        return None;
+    }
+    let scale = crate::jpeg_fast::pick_scale((fw, fh), JPEG_FAST_TARGET);
+    if scale <= 1 {
+        return None; // 不夠大，直接全解比較划算
+    }
+
+    // EXIF 方向要與最終版本一致，否則替換時畫面會翻轉
+    let orientation = jpeg_orientation(path);
+    // 方向若含 90/270 度旋轉，回報的原始尺寸要跟著對調
+    let swapped = matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    let orig_size = if swapped { [fh, fw] } else { [fw, fh] };
+
+    if let Ok((img, _)) = crate::jpeg_fast::decode_scaled(path, scale) {
+        // 使用者已翻到別張就別再送了
+        if latest_gen.load(AtomicOrdering::Relaxed) != generation {
+            return None;
+        }
+        let mut di = DynamicImage::ImageRgba8(img);
+        di.apply_orientation(orientation);
+        emit_static(
+            path,
+            di.into_rgba8(),
+            orig_size,
+            file_size,
+            "JPEG",
+            generation,
+            send,
+        );
+    }
+
+    // 第二階段：全解析度
+    if latest_gen.load(AtomicOrdering::Relaxed) != generation {
+        // 已被作廢；回傳目前為止的低解析度結果讓快取留著也無妨，
+        // 但為了不讓快取存到半成品，這裡回報未完成
+        return None;
+    }
+    let full = match decode_static(path) {
+        Ok((rgba, _)) => rgba,
+        Err(e) => return Some(Err(e)),
+    };
+    let (meta, frame, mips) =
+        emit_static(path, full, orig_size, file_size, "JPEG", generation, send);
+    let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
+    Some(Ok(Decoded {
+        meta,
+        frames: vec![frame],
+        mips,
+        complete: true,
+        truncated: false,
+        bytes,
+    }))
+}
+
+/// 只讀標頭取得 EXIF 方向
+fn jpeg_orientation(path: &Path) -> Orientation {
+    open_buffered(path)
+        .ok()
+        .and_then(|r| JpegDecoder::new(r).ok())
+        .and_then(|mut d| d.orientation().ok())
+        .unwrap_or(Orientation::NoTransforms)
+}
+
+/// 內嵌預覽的最長邊小於此值時，額外做一次完整顯影補上細節。
+/// 多數機種內嵌全解析度預覽（此時不會觸發），Sony 等機種只給約 1600px。
+const RAW_PREVIEW_ENOUGH: u32 = 2400;
+
+/// RAW 漸進式解碼：
+/// 1. 抽內嵌 JPEG 預覽 → 立刻送出，畫面數十毫秒內出現
+/// 2. 預覽解析度不足時，背景做完整 demosaic → 送出同一格的高解析度版本取代
+///
+/// UI 端的 Frame 事件會覆寫同 index 的影格，因此不需要額外協定。
+fn decode_raw_progressive(
+    path: &Path,
+    file_size: u64,
+    generation: u64,
+    latest_gen: &AtomicU64,
+    send: &dyn Fn(LoadEvent),
+) -> Result<Decoded, String> {
+    let emit = |rgba: RgbaImage, label: &str| -> (ImageMeta, FrameData, Vec<Arc<ColorImage>>) {
+        let meta = ImageMeta {
+            path: path.to_path_buf(),
+            orig_size: [rgba.width(), rgba.height()],
+            file_size,
+            format: label.to_owned(),
+            animated: false,
+            has_alpha: false,
+        };
+        send(LoadEvent::Meta {
+            generation,
+            meta: meta.clone(),
+        });
+        let base = Arc::new(to_color_image_clamped(rgba));
+        let frame = FrameData {
+            image: base.clone(),
+            delay: Duration::ZERO,
+        };
+        send(LoadEvent::Frame {
+            generation,
+            index: 0,
+            frame: frame.clone(),
+        });
+        let mips = build_mips(base);
+        send(LoadEvent::Mips {
+            generation,
+            mips: mips.clone(),
+        });
+        (meta, frame, mips)
+    };
+
+    let preview = crate::raw_preview::extract(path);
+    let (mut meta, mut frame, mut mips) = match preview {
+        Some(p) => {
+            let enough = p.size.0.max(p.size.1) >= RAW_PREVIEW_ENOUGH;
+            let label = if enough { "RAW" } else { "RAW（預覽）" };
+            let r = emit(p.image, label);
+            if enough {
+                // 預覽已是全解析度等級，不必再花 CPU 顯影
+                let bytes = Decoded::compute_bytes(std::slice::from_ref(&r.1), &r.2);
+                return Ok(Decoded {
+                    meta: r.0,
+                    frames: vec![r.1],
+                    mips: r.2,
+                    complete: true,
+                    truncated: false,
+                    bytes,
+                });
+            }
+            r
+        }
+        None => {
+            // 沒有內嵌預覽：只能直接完整顯影
+            let rgba = crate::extra_formats::develop_raw(path)?;
+            let r = emit(rgba, "RAW");
+            let bytes = Decoded::compute_bytes(std::slice::from_ref(&r.1), &r.2);
+            return Ok(Decoded {
+                meta: r.0,
+                frames: vec![r.1],
+                mips: r.2,
+                complete: true,
+                truncated: false,
+                bytes,
+            });
+        }
+    };
+
+    // 預覽偏小 → 補上完整顯影。使用者已翻到別張就不浪費 CPU。
+    if latest_gen.load(AtomicOrdering::Relaxed) == generation {
+        // 顯影失敗（例如 CR3 的原始資料不支援）就維持預覽版本
+        if let Ok(rgba) = crate::extra_formats::develop_raw(path) {
+            let r = emit(rgba, "RAW（完整顯影）");
+            meta = r.0;
+            frame = r.1;
+            mips = r.2;
+        }
+    }
+
+    let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
+    Ok(Decoded {
+        meta,
+        frames: vec![frame],
+        mips,
+        complete: true,
+        truncated: false,
+        bytes,
+    })
+}
+
 /// 預載：靜態圖全解（含 mip 鏈）；動畫只解第一格，翻到時再全解。
 fn decode_prefetch(path: &Path) -> Result<Decoded, String> {
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -320,7 +580,25 @@ fn decode_prefetch(path: &Path) -> Result<Decoded, String> {
             &ignore,
         )
     } else {
-        let (rgba, fmt) = decode_static(path)?;
+        // RAW 預載只抽內嵌預覽（快）；預覽解析度不足時標記為未完成，
+        // 使用者真的翻到時才會由高優先權工作補上完整顯影
+        let mut complete = true;
+        let (rgba, fmt) =
+            if crate::extra_formats::sniff(path) == Some(crate::extra_formats::ExtraFormat::Raw) {
+                match crate::raw_preview::extract(path) {
+                    Some(p) => {
+                        let enough = p.size.0.max(p.size.1) >= RAW_PREVIEW_ENOUGH;
+                        complete = enough;
+                        (
+                            p.image,
+                            if enough { "RAW" } else { "RAW（預覽）" }.to_owned(),
+                        )
+                    }
+                    None => decode_static(path)?,
+                }
+            } else {
+                decode_static(path)?
+            };
         let orig_size = [rgba.width(), rgba.height()];
         let has_alpha = rgba_has_alpha(&rgba);
         let base = Arc::new(to_color_image_clamped(rgba));
@@ -341,7 +619,7 @@ fn decode_prefetch(path: &Path) -> Result<Decoded, String> {
             },
             frames: vec![frame],
             mips,
-            complete: true,
+            complete,
             truncated: false,
             bytes,
         })

@@ -15,7 +15,7 @@ $exts = @("jpg","jpeg","jpe","jfif","png","apng","gif","webp","bmp","dib","ico",
           # modern container formats
           "jxl","avif","avifs","heic","heif","hif",
           # camera RAW
-          "cr2","crw","nef","nrw","arw","srf","sr2","dng","raf","orf","rw2","pef",
+          "cr2","cr3","crw","nef","nrw","arw","srf","sr2","dng","raf","orf","rw2","pef",
           "srw","erf","mrw","mos","iiq","3fr","dcr","kdc","mef","rwl","x3f")
 
 $classes = "HKCU:\Software\Classes"

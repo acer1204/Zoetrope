@@ -3,6 +3,8 @@ pub mod appicon;
 pub mod cache;
 pub mod dirlist;
 pub mod extra_formats;
+pub mod jpeg_fast;
 pub mod loader;
+pub mod raw_preview;
 pub mod samplegen;
 pub mod types;

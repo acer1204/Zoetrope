@@ -37,6 +37,8 @@ Windows / macOS / Linux 同一套程式碼。
   以及 **JPEG XL、AVIF、HEIC/HEIF、相機 RAW**（CR2/NEF/ARW/DNG…）——
   全部純 Rust 解碼，**不需要安裝任何 C 函式庫或系統擴充功能**
 - **內容偵測**：以檔頭判斷真實格式，副檔名標錯（例如 JPEG 存成 `.png`）也能正常開啟
+- **RAW 漸進式載入**：先抽相機內嵌的 JPEG 預覽（13–90ms）立即顯示，
+  預覽解析度不足時才在背景補上完整 demosaic 顯影並無縫替換
 
 ## 安裝
 
@@ -181,8 +183,6 @@ JPEG XL / HEIC / RAW 若要驗證，把樣本檔放進 `tests/assets/` 即會自
 ## 已知限制
 
 - 超過 8192px 的圖以縮小後貼圖顯示（未做分塊放大，1:1 檢視略軟）
-- RAW 為完整顯影（demosaic），大檔首次開啟需時較久
-- Canon CR3 尚未支援（rawloader 未涵蓋該容器）
 - 動畫 AVIF / 動畫 HEIF 只顯示第一格
 - 尚無縮圖牆／幻燈片模式
 - HDR / EXR 未做色調映射，直接截斷至一般亮度範圍

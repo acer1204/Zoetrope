@@ -6,7 +6,7 @@ $ErrorActionPreference = "SilentlyContinue"
 $exts = @("jpg","jpeg","jpe","jfif","png","apng","gif","webp","bmp","dib","ico",
           "tif","tiff","tga","qoi","hdr","exr","pnm","pbm","pgm","ppm","dds","ff",
           "jxl","avif","avifs","heic","heif","hif",
-          "cr2","crw","nef","nrw","arw","srf","sr2","dng","raf","orf","rw2","pef",
+          "cr2","cr3","crw","nef","nrw","arw","srf","sr2","dng","raf","orf","rw2","pef",
           "srw","erf","mrw","mos","iiq","3fr","dcr","kdc","mef","rwl","x3f")
 
 foreach ($e in $exts) {

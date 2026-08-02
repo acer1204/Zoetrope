@@ -5786,6 +5786,7 @@ dependencies = [
  "heic",
  "image 0.25.10",
  "imagepipe",
+ "jpeg-decoder",
  "jxl-oxide",
  "ravif 0.11.20",
  "rawloader",
