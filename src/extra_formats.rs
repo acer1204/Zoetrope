@@ -28,9 +28,11 @@ impl ExtraFormat {
 
 /// 相機 RAW 副檔名（rawloader 支援的主要機種）。
 /// RAW 幾乎都是 TIFF 變體，無法只靠檔頭區分，因此以副檔名判斷。
+/// cr3 走 ISOBMFF 容器，rawloader 不支援其原始資料，
+/// 但可抽出內嵌預覽顯示（見 raw_preview）
 pub const RAW_EXTS: &[&str] = &[
-    "cr2", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "pef", "srw",
-    "erf", "mrw", "mos", "iiq", "3fr", "dcr", "kdc", "mef", "rwl", "x3f",
+    "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "pef",
+    "srw", "erf", "mrw", "mos", "iiq", "3fr", "dcr", "kdc", "mef", "rwl", "x3f",
 ];
 
 /// 現代容器格式副檔名
@@ -131,6 +133,16 @@ fn decode_heif(path: &Path, fmt: ExtraFormat) -> Result<RgbaImage, String> {
 }
 
 fn decode_raw(path: &Path) -> Result<RgbaImage, String> {
+    // 優先用內嵌預覽：數十毫秒 vs. 完整顯影的 1–2 秒。
+    // 相機內嵌的多是全解析度 JPEG，正是使用者想看的畫面。
+    if let Some(prev) = crate::raw_preview::extract(path) {
+        return Ok(prev.image);
+    }
+    develop_raw(path)
+}
+
+/// 完整 demosaic 顯影（沒有可用內嵌預覽時的回退路徑）
+pub fn develop_raw(path: &Path) -> Result<RgbaImage, String> {
     // 0,0 = 不限制輸出尺寸（完整解析度）
     let srgb =
         imagepipe::simple_decode_8bit(path, 0, 0).map_err(|e| format!("RAW 解碼失敗：{e}"))?;
