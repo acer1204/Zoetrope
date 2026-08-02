@@ -134,6 +134,11 @@ pub enum LoadEvent {
         generation: u64,
         entries: Vec<FileEntry>,
     },
+    /// 膠捲條縮圖完成
+    Thumb {
+        path: PathBuf,
+        image: Arc<ColorImage>,
+    },
 }
 
 /// UI → 背景工作的工作項目
@@ -144,4 +149,6 @@ pub enum Job {
     Prefetch { path: PathBuf },
     /// 掃描資料夾建立瀏覽清單
     ScanDir { dir: PathBuf, generation: u64 },
+    /// 膠捲條縮圖（最低優先權，不得排擠鄰居預載）
+    Thumb { path: PathBuf },
 }

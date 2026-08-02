@@ -26,17 +26,24 @@ use crate::types::*;
 pub struct Loader {
     hi_tx: Sender<Job>,
     lo_tx: Sender<Job>,
+    /// 最低優先權：膠捲條縮圖。獨立一條佇列，
+    /// 快速捲動膠捲條時才不會把鄰居預載餓死。
+    th_tx: Sender<Job>,
     pub events: Receiver<LoadEvent>,
     pub latest_gen: Arc<AtomicU64>,
     cache: Arc<Mutex<Cache>>,
+    /// 已排入佇列的縮圖路徑，避免重複請求
+    thumb_pending: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
 }
 
 impl Loader {
     pub fn new(ctx: Context, cache: Arc<Mutex<Cache>>) -> Self {
         let (hi_tx, hi_rx) = unbounded::<Job>();
         let (lo_tx, lo_rx) = unbounded::<Job>();
+        let (th_tx, th_rx) = unbounded::<Job>();
         let (ev_tx, ev_rx) = unbounded::<LoadEvent>();
         let latest_gen = Arc::new(AtomicU64::new(0));
+        let thumb_pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -47,22 +54,36 @@ impl Loader {
         for wi in 0..workers {
             let hi_rx = hi_rx.clone();
             let lo_rx = lo_rx.clone();
+            let th_rx = th_rx.clone();
             let ev_tx = ev_tx.clone();
             let ctx = ctx.clone();
             let latest_gen = latest_gen.clone();
             let cache = cache.clone();
+            let pending = thumb_pending.clone();
             std::thread::Builder::new()
                 .name(format!("decode-{wi}"))
-                .spawn(move || worker_loop(hi_rx, lo_rx, ev_tx, ctx, latest_gen, cache))
+                .spawn(move || {
+                    worker_loop(hi_rx, lo_rx, th_rx, ev_tx, ctx, latest_gen, cache, pending)
+                })
                 .expect("spawn decode worker");
         }
 
         Self {
             hi_tx,
             lo_tx,
+            th_tx,
             events: ev_rx,
             latest_gen,
             cache,
+            thumb_pending,
+        }
+    }
+
+    /// 請求一張膠捲條縮圖（最低優先權，重複請求會被忽略）
+    pub fn request_thumb(&self, path: PathBuf) {
+        let mut pending = self.thumb_pending.lock().unwrap();
+        if pending.insert(path.clone()) {
+            let _ = self.th_tx.send(Job::Thumb { path });
         }
     }
 
@@ -107,21 +128,26 @@ impl Loader {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     hi_rx: Receiver<Job>,
     lo_rx: Receiver<Job>,
+    th_rx: Receiver<Job>,
     ev_tx: Sender<LoadEvent>,
     ctx: Context,
     latest_gen: Arc<AtomicU64>,
     cache: Arc<Mutex<Cache>>,
+    thumb_pending: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
 ) {
     loop {
-        // 先清空高優先權佇列，兩邊都空才阻塞等待
-        let job = match hi_rx.try_recv() {
+        // 嚴格優先權：目前圖片 > 鄰居預載 > 膠捲條縮圖。
+        // 三條都空才阻塞等待，確保捲膠捲條不會拖慢翻頁。
+        let job = match hi_rx.try_recv().or_else(|_| lo_rx.try_recv()) {
             Ok(j) => j,
             Err(_) => crossbeam_channel::select! {
                 recv(hi_rx) -> j => match j { Ok(j) => j, Err(_) => return },
                 recv(lo_rx) -> j => match j { Ok(j) => j, Err(_) => return },
+                recv(th_rx) -> j => match j { Ok(j) => j, Err(_) => return },
             },
         };
         let send = |ev: LoadEvent| {
@@ -174,6 +200,17 @@ fn worker_loop(
                     send(LoadEvent::Prefetched { path });
                 }
                 // 預載失敗不回報：使用者真的翻到那張時會以高優先權重試並顯示錯誤
+            }
+            Job::Thumb { path } => {
+                // 縮圖失敗不回報事件，UI 端會維持「載入中」的佔位樣式
+                let r = catch_unwind(AssertUnwindSafe(|| crate::thumbs::make(&path)));
+                thumb_pending.lock().unwrap().remove(&path);
+                if let Ok(Some(image)) = r {
+                    send(LoadEvent::Thumb {
+                        path,
+                        image: Arc::new(image),
+                    });
+                }
             }
         }
     }
@@ -973,6 +1010,23 @@ pub fn decode_static(path: &Path) -> Result<(RgbaImage, String), String> {
     // image crate 不支援的格式先走專用解碼器（JPEG XL / AVIF / HEIC / RAW）
     if let Some(fmt) = crate::extra_formats::sniff(path) {
         return crate::extra_formats::decode(path, fmt).map(|img| (img, fmt.name().to_owned()));
+    }
+
+    // JPEG XR：HDR 來源在這條路徑上先套預設色調映射轉成 8-bit
+    // （縮圖等用途需要的是可顯示的影像；完整 HDR 流程走 decode_streaming）
+    if is_jxr(path) {
+        return match crate::jxr::decode(path)? {
+            crate::jxr::JxrImage::Sdr(img) => Ok((img, "JPEG XR".to_owned())),
+            crate::jxr::JxrImage::Hdr(h) => {
+                let lut = crate::hdr::ToneLut::build(0.0, crate::hdr::ToneOp::Aces);
+                let ci = crate::hdr::tonemap(&h, &lut);
+                let mut out = RgbaImage::new(h.size[0] as u32, h.size[1] as u32);
+                for (px, c) in out.pixels_mut().zip(ci.pixels.iter()) {
+                    *px = image::Rgba([c.r(), c.g(), c.b(), c.a()]);
+                }
+                Ok((out, "JPEG XR (HDR)".to_owned()))
+            }
+        };
     }
 
     let reader = ImageReader::open(path)

@@ -267,6 +267,14 @@ pub struct ViewerApp {
     fullscreen: bool,
     show_info: bool,
     show_about: bool,
+
+    /// 膠捲條：縮圖快取、已建立的貼圖、是否釘選顯示
+    thumbs: crate::thumbs::ThumbCache,
+    thumb_tex: std::collections::HashMap<PathBuf, egui::TextureHandle>,
+    strip_pinned: bool,
+    /// 需要把目前索引捲進可見範圍（翻頁後觸發）
+    strip_scroll_to_current: bool,
+
     prefs: Prefs,
 }
 
@@ -311,6 +319,10 @@ impl ViewerApp {
             fullscreen: false,
             show_info: false,
             show_about: false,
+            thumbs: crate::thumbs::ThumbCache::default(),
+            thumb_tex: std::collections::HashMap::new(),
+            strip_pinned: false,
+            strip_scroll_to_current: false,
             prefs,
         };
         if let Some(p) = initial {
@@ -424,6 +436,7 @@ impl ViewerApp {
         let new = (self.index as isize + delta).clamp(0, last) as usize;
         if new != self.index {
             self.index = new;
+            self.strip_scroll_to_current = true;
             let p = self.entries[new].path.clone();
             self.open_path(ctx, p);
         }
@@ -432,6 +445,7 @@ impl ViewerApp {
     fn nav_to(&mut self, ctx: &Context, idx: usize) {
         if idx < self.entries.len() && idx != self.index {
             self.index = idx;
+            self.strip_scroll_to_current = true;
             let p = self.entries[idx].path.clone();
             self.open_path(ctx, p);
         }
@@ -624,6 +638,9 @@ impl ViewerApp {
                         self.update_title(ctx);
                     }
                 }
+                LoadEvent::Thumb { path, image } => {
+                    self.thumbs.insert(path, image);
+                }
                 LoadEvent::Prefetched { path } => {
                     // 使用者正好翻到還沒解完的這張：直接採用快取的預載結果。
                     // 動畫的完整解碼已由 open_path 排入高優先佇列，這裡不再重複請求。
@@ -765,6 +782,7 @@ impl ViewerApp {
             open: bool,
             reload: bool,
             sort_flip: bool,
+            strip: bool,
             step_fwd: bool,
             step_back: bool,
             mouse_back: bool,
@@ -794,6 +812,7 @@ impl ViewerApp {
             open: i.key_pressed(Key::O),
             reload: i.key_pressed(Key::F5),
             sort_flip: i.key_pressed(Key::S),
+            strip: i.key_pressed(Key::T),
             step_fwd: i.key_pressed(Key::Period),
             step_back: i.key_pressed(Key::Comma),
             mouse_back: i.pointer.button_pressed(PointerButton::Extra1),
@@ -816,6 +835,12 @@ impl ViewerApp {
         if k.sort_flip {
             self.prefs.sort_asc = !self.prefs.sort_asc;
             self.apply_sort();
+        }
+        if k.strip {
+            self.strip_pinned = !self.strip_pinned;
+            if self.strip_pinned {
+                self.strip_scroll_to_current = true;
+            }
         }
         if k.space {
             let animated = self.current.as_ref().is_some_and(|c| c.frames.len() > 1);
@@ -1572,6 +1597,16 @@ impl ViewerApp {
                     {
                         self.show_about = !self.show_about;
                     }
+                    if ui
+                        .selectable_label(self.strip_pinned, "▤")
+                        .on_hover_text("膠捲條 (T)：釘選顯示；未釘選時滑鼠移到底部也會浮出")
+                        .clicked()
+                    {
+                        self.strip_pinned = !self.strip_pinned;
+                        if self.strip_pinned {
+                            self.strip_scroll_to_current = true;
+                        }
+                    }
                 });
 
                 if act_open {
@@ -1645,6 +1680,175 @@ impl ViewerApp {
                 });
             });
         });
+    }
+
+    /// 底部膠捲條。
+    ///
+    /// 刻意用 `Area` 而非 `TopBottomPanel::show_animated`——後者在淡入淡出
+    /// 的中間狀態會畫一個空面板（內容整個消失），而且會擠壓 CentralPanel
+    /// 導致圖片跟著跳動。
+    fn filmstrip(&mut self, ctx: &Context) {
+        const STRIP_H: f32 = 92.0;
+        const CELL_W: f32 = 108.0;
+        const HOVER_ZONE: f32 = 70.0;
+
+        if self.entries.len() < 2 {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        // 滑鼠靠近底部或已釘選就展開
+        let near_bottom = ctx
+            .input(|i| i.pointer.hover_pos())
+            .is_some_and(|p| p.y > screen.bottom() - HOVER_ZONE);
+        let want = self.strip_pinned || near_bottom;
+        let t = ctx.animate_bool_with_time(egui::Id::new("filmstrip"), want, 0.18);
+        if t <= 0.001 {
+            return;
+        }
+
+        let strip_rect = Rect::from_min_size(
+            egui::pos2(screen.left(), screen.bottom() - STRIP_H),
+            egui::vec2(screen.width(), STRIP_H),
+        );
+        let mut clicked: Option<usize> = None;
+
+        egui::Area::new(egui::Id::new("filmstrip-area"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(strip_rect.min)
+            .show(ctx, |ui| {
+                ui.set_opacity(t);
+                ui.set_min_size(strip_rect.size());
+                ui.set_max_size(strip_rect.size());
+                egui::Frame::none()
+                    .fill(Color32::from_rgba_unmultiplied(16, 16, 18, 235))
+                    .inner_margin(egui::Margin::symmetric(6.0, 5.0))
+                    .show(ui, |ui| {
+                        // 垂直滾輪要能捲動這個只啟用水平方向的區域
+                        ui.style_mut().always_scroll_the_only_direction = true;
+                        ui.set_height(STRIP_H - 10.0);
+                        clicked = self.strip_contents(ui, CELL_W, STRIP_H - 10.0);
+                    });
+            });
+
+        if let Some(i) = clicked {
+            self.nav_to(ctx, i);
+        }
+    }
+
+    /// 膠捲條內容：只為可見範圍的格子請求縮圖與建立貼圖
+    fn strip_contents(&mut self, ui: &mut egui::Ui, cell_w: f32, cell_h: f32) -> Option<usize> {
+        let n = self.entries.len();
+        let spacing = ui.spacing().item_spacing.x;
+        let step = cell_w + spacing;
+        let total_w = step * n as f32;
+        let mut clicked = None;
+        let cur = self.index;
+        let scroll_to = std::mem::take(&mut self.strip_scroll_to_current);
+
+        let mut area = egui::ScrollArea::horizontal()
+            .auto_shrink([false, false])
+            .id_salt("filmstrip-scroll");
+        if scroll_to {
+            // 讓目前這格置中
+            let target = step * cur as f32 + cell_w * 0.5 - ui.available_width() * 0.5;
+            area = area.horizontal_scroll_offset(target.max(0.0));
+        }
+
+        area.show_viewport(ui, |ui, viewport| {
+            ui.set_width(total_w);
+            ui.set_height(cell_h);
+            // 只處理可見範圍（含少量前後緩衝），這是效能關鍵
+            let first = ((viewport.min.x / step).floor() as isize - 2).max(0) as usize;
+            let last = (((viewport.max.x / step).ceil() as usize) + 2).min(n);
+
+            for i in first..last {
+                let x = step * i as f32;
+                let rect = Rect::from_min_size(
+                    ui.min_rect().min + Vec2::new(x, 0.0),
+                    egui::vec2(cell_w, cell_h),
+                );
+                let resp = ui.allocate_rect(rect, Sense::click());
+                if resp.clicked() {
+                    clicked = Some(i);
+                }
+                self.draw_thumb_cell(ui, rect, i, i == cur, resp.hovered());
+            }
+        });
+        clicked
+    }
+
+    fn draw_thumb_cell(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        index: usize,
+        is_current: bool,
+        hovered: bool,
+    ) {
+        let path = self.entries[index].path.clone();
+        let painter = ui.painter();
+
+        // 目前這格用醒目外框，滑過時淡淡highlight
+        if is_current {
+            painter.rect_filled(rect, 3.0, Color32::from_rgba_unmultiplied(90, 130, 200, 90));
+        } else if hovered {
+            painter.rect_filled(
+                rect,
+                3.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+            );
+        }
+
+        // 取得（或請求）縮圖
+        let tex = match self.thumb_tex.get(&path) {
+            Some(t) => Some(t.clone()),
+            None => match self.thumbs.get(&path) {
+                Some(img) => {
+                    let t = ui.ctx().load_texture(
+                        format!("thumb{index}"),
+                        egui::ImageData::Color(img),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.thumb_tex.insert(path.clone(), t.clone());
+                    Some(t)
+                }
+                None => {
+                    self.loader.request_thumb(path.clone());
+                    None
+                }
+            },
+        };
+
+        let painter = ui.painter();
+        let inner = rect.shrink(4.0);
+        match tex {
+            Some(t) => {
+                let sz = t.size_vec2();
+                let scale = (inner.width() / sz.x).min(inner.height() / sz.y);
+                let draw = Rect::from_center_size(inner.center(), sz * scale);
+                painter.image(
+                    t.id(),
+                    draw,
+                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                if is_current {
+                    painter.rect_stroke(
+                        draw.expand(1.5),
+                        2.0,
+                        egui::Stroke::new(2.0_f32, Color32::from_rgb(120, 170, 255)),
+                    );
+                }
+            }
+            None => {
+                // 佔位：淡淡的方框，避免捲動時畫面空洞
+                painter.rect_filled(
+                    inner,
+                    3.0,
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                );
+            }
+        }
     }
 
     fn about_window(&mut self, ctx: &Context) {
@@ -1812,6 +2016,7 @@ impl eframe::App for ViewerApp {
             .show(ctx, |ui| {
                 self.canvas(ui);
             });
+        self.filmstrip(ctx);
         self.info_window(ctx);
         self.about_window(ctx);
     }

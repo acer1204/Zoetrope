@@ -9,4 +9,5 @@ pub mod jxr;
 pub mod loader;
 pub mod raw_preview;
 pub mod samplegen;
+pub mod thumbs;
 pub mod types;
