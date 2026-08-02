@@ -50,6 +50,9 @@ pub struct ImageMeta {
 /// 解碼完成後放進快取的完整結果
 pub struct Decoded {
     pub meta: ImageMeta,
+    /// HDR/EXR 的浮點原始資料。保留它才能在調整曝光時
+    /// 重新色調映射而不必重新解碼（動畫與一般 8-bit 影像為 None）。
+    pub hdr: Option<Arc<crate::hdr::HdrImage>>,
     pub frames: Vec<FrameData>,
     /// 靜態圖的 mip 鏈：[0] 為基底貼圖，之後每層長寬減半（動畫為空）
     pub mips: Vec<Arc<ColorImage>>,
@@ -66,6 +69,15 @@ impl Decoded {
         // mips[0] 與 frames[0].image 是同一份 Arc，不重複計算
         let m: usize = mips.iter().skip(1).map(|m| m.pixels.len() * 4).sum();
         f + m
+    }
+
+    /// 含 HDR 浮點資料的總記憶體量（LRU 預算要算進去，否則會嚴重低估）
+    pub fn compute_bytes_with_hdr(
+        frames: &[FrameData],
+        mips: &[Arc<ColorImage>],
+        hdr: Option<&crate::hdr::HdrImage>,
+    ) -> usize {
+        Self::compute_bytes(frames, mips) + hdr.map_or(0, |h| h.bytes())
     }
 }
 

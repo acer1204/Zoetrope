@@ -147,6 +147,8 @@ struct TexCache {
 
 struct CurrentImage {
     meta: ImageMeta,
+    /// HDR/EXR 的浮點原始資料，調整曝光時重新色調映射用
+    hdr: Option<Arc<crate::hdr::HdrImage>>,
     frames: Vec<FrameData>,
     mips: Vec<Arc<eframe::egui::ColorImage>>,
     complete: bool,
@@ -158,6 +160,7 @@ impl CurrentImage {
     fn empty(meta: ImageMeta) -> Self {
         Self {
             meta,
+            hdr: None,
             frames: Vec::new(),
             mips: Vec::new(),
             complete: false,
@@ -168,6 +171,7 @@ impl CurrentImage {
     fn from_decoded(d: &Decoded) -> Self {
         Self {
             meta: d.meta.clone(),
+            hdr: d.hdr.clone(),
             frames: d.frames.clone(),
             mips: d.mips.clone(),
             complete: d.complete,
@@ -214,8 +218,13 @@ pub struct ViewerApp {
     wheel_accum: f32,
     last_wheel: Option<Instant>,
 
+    /// HDR 曝光補償（EV，實際乘數為 2^ev）
+    exposure_ev: f32,
+    tone_op: crate::hdr::ToneOp,
+
     fullscreen: bool,
     show_info: bool,
+    show_about: bool,
     prefs: Prefs,
 }
 
@@ -255,8 +264,11 @@ impl ViewerApp {
             next_frame_at: None,
             wheel_accum: 0.0,
             last_wheel: None,
+            exposure_ev: 0.0,
+            tone_op: crate::hdr::ToneOp::Aces,
             fullscreen: false,
             show_info: false,
+            show_about: false,
             prefs,
         };
         if let Some(p) = initial {
@@ -338,6 +350,21 @@ impl ViewerApp {
         self.frame_idx = 0;
         self.next_frame_at = None;
         self.playing = true;
+    }
+
+    /// 以目前的曝光與運算子重新色調映射 HDR 影像。
+    /// 只重建查表（約 1ms）與重跑映射（4K 約 15ms），不重新解碼。
+    fn retonemap(&mut self) {
+        let Some(cur) = &mut self.current else { return };
+        let Some(hdr) = cur.hdr.clone() else { return };
+        let lut = crate::hdr::ToneLut::build(self.exposure_ev, self.tone_op);
+        let base = Arc::new(crate::hdr::tonemap(&hdr, &lut));
+        cur.frames = vec![FrameData {
+            image: base.clone(),
+            delay: Duration::ZERO,
+        }];
+        cur.mips = crate::loader::build_mips(base);
+        cur.tex.static_mips.clear(); // 讓貼圖重新上傳
     }
 
     /// 載入中的新圖已有可畫的影格 → 取代畫面上的舊圖
@@ -525,6 +552,15 @@ impl ViewerApp {
                     }
                     // 解碼結束仍在等待 → 換上（防禦：正常情況第一格早已觸發）
                     self.promote_if_ready(ctx);
+                    // HDR 的浮點原始資料不走事件協定，解碼完成後從快取取回，
+                    // 之後調整曝光才不必重新解碼
+                    if let Some(c) = &mut self.current {
+                        if c.hdr.is_none() {
+                            if let Some(d) = self.loader.peek(&c.meta.path) {
+                                c.hdr = d.hdr.clone();
+                            }
+                        }
+                    }
                     if self.awaiting {
                         // 沒有任何影格可顯示，結束等待狀態
                         self.awaiting = false;
@@ -1371,6 +1407,45 @@ impl ViewerApp {
                     act_rot_cw = true;
                 }
 
+                // HDR 影像才顯示這顆按鈕；選單內含曝光與色調映射運算子
+                if self.current.as_ref().is_some_and(|c| c.hdr.is_some()) {
+                    ui.separator();
+                    let mut changed = false;
+                    ui.menu_button("HDR", |ui| {
+                        ui.label("曝光補償");
+                        let sl = egui::Slider::new(&mut self.exposure_ev, -6.0..=6.0)
+                            .suffix(" EV")
+                            .step_by(0.1);
+                        if ui.add(sl).changed() {
+                            changed = true;
+                        }
+                        if ui.button("重設為 0 EV").clicked() {
+                            self.exposure_ev = 0.0;
+                            changed = true;
+                        }
+                        ui.separator();
+                        ui.label("色調映射");
+                        for op in [
+                            crate::hdr::ToneOp::Aces,
+                            crate::hdr::ToneOp::Reinhard,
+                            crate::hdr::ToneOp::Clip,
+                        ] {
+                            if ui.radio_value(&mut self.tone_op, op, op.name()).changed() {
+                                changed = true;
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(format!(
+                        "HDR 顯示設定：{:+.1} EV · {}",
+                        self.exposure_ev,
+                        self.tone_op.name()
+                    ));
+                    if changed {
+                        self.retonemap();
+                    }
+                }
+
                 let animated = self.current.as_ref().is_some_and(|c| c.frames.len() > 1);
                 if animated {
                     ui.separator();
@@ -1397,6 +1472,13 @@ impl ViewerApp {
                         .clicked()
                     {
                         self.show_info = !self.show_info;
+                    }
+                    if ui
+                        .selectable_label(self.show_about, "？")
+                        .on_hover_text("關於 Zoetrope")
+                        .clicked()
+                    {
+                        self.show_about = !self.show_about;
                     }
                 });
 
@@ -1471,6 +1553,74 @@ impl ViewerApp {
                 });
             });
         });
+    }
+
+    fn about_window(&mut self, ctx: &Context) {
+        if !self.show_about {
+            return;
+        }
+        const REPO: &str = "https://github.com/acer1204/Zoetrope";
+        let mut open = self.show_about;
+        egui::Window::new("關於")
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Zoetrope 走馬燈").size(22.0).strong());
+                    ui.label(
+                        egui::RichText::new(format!("版本 {}", env!("CARGO_PKG_VERSION")))
+                            .size(13.0)
+                            .weak(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label("極速跨平台看圖軟體");
+                    ui.label(
+                        egui::RichText::new("以 Rust + egui + wgpu 打造")
+                            .size(12.0)
+                            .weak(),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                egui::Grid::new("about-grid")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("專案首頁");
+                        ui.hyperlink_to("github.com/acer1204/Zoetrope", REPO);
+                        ui.end_row();
+                        ui.label("回報問題");
+                        ui.hyperlink_to("Issues", format!("{REPO}/issues"));
+                        ui.end_row();
+                        ui.label("最新版本");
+                        ui.hyperlink_to("Releases", format!("{REPO}/releases"));
+                        ui.end_row();
+                        ui.label("授權");
+                        ui.hyperlink_to("AGPL-3.0", format!("{REPO}/blob/main/LICENSE"));
+                        ui.end_row();
+                        ui.label("繪圖後端");
+                        ui.label(&self.renderer_label);
+                        ui.end_row();
+                        ui.label("貼圖上限");
+                        ui.label(format!("{0} × {0} px", crate::loader::max_tex_side()));
+                        ui.end_row();
+                    });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
+                        "本程式使用 jxl-oxide（JPEG XL）、heic（HEIC/AVIF）、\n\
+                         rawloader 與 imagepipe（相機 RAW）等開源元件，\n\
+                         各自的授權條款詳見專案 README。",
+                    )
+                    .size(11.0)
+                    .weak(),
+                );
+            });
+        self.show_about = open;
     }
 
     fn info_window(&mut self, ctx: &Context) {
@@ -1571,6 +1721,7 @@ impl eframe::App for ViewerApp {
                 self.canvas(ui);
             });
         self.info_window(ctx);
+        self.about_window(ctx);
     }
 }
 

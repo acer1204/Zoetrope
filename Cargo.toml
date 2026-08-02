@@ -21,6 +21,7 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 
 # 額外格式解碼器（全部純 Rust，免 C 相依）
+half = "2"                                          # HDR/EXR 的 f16 像素儲存
 jpeg-decoder = "0.3"                                # JPEG DCT 縮放解碼（漸進式載入用）
 jxl-oxide = "0.12"                                  # JPEG XL
 heic = { version = "0.1", features = ["av1"] }      # HEIC/HEIF（HEVC）+ AVIF

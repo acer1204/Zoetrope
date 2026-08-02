@@ -112,6 +112,7 @@ mod tests {
         }];
         let bytes = Decoded::compute_bytes(&frames, &[]);
         Arc::new(Decoded {
+            hdr: None,
             meta: ImageMeta {
                 path: PathBuf::new(),
                 orig_size: [bytes_px as u32, 1],

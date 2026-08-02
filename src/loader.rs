@@ -246,6 +246,11 @@ fn decode_streaming(
         return decode_raw_progressive(path, file_size, generation, latest_gen, send);
     }
 
+    // HDR / EXR：保留浮點資料，套色調映射後才顯示
+    if is_hdr_file(path) {
+        return decode_hdr(path, file_size, generation, send);
+    }
+
     let kind = sniff_animation_kind(path, &ext);
     // 大 JPEG 走漸進式：先以 DCT 縮放解出低解析度版本，再補全解析度
     if kind.is_empty() && is_jpeg_file(path) {
@@ -302,6 +307,7 @@ fn decode_streaming(
 
         let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
         Ok(Decoded {
+            hdr: None,
             meta,
             frames: vec![frame],
             mips,
@@ -437,6 +443,7 @@ fn decode_jpeg_progressive(
         emit_static(path, full, orig_size, file_size, "JPEG", generation, send);
     let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
     Some(Ok(Decoded {
+        hdr: None,
         meta,
         frames: vec![frame],
         mips,
@@ -444,6 +451,88 @@ fn decode_jpeg_progressive(
         truncated: false,
         bytes,
     }))
+}
+
+fn is_hdr_file(path: &Path) -> bool {
+    matches!(
+        ImageReader::open(path)
+            .ok()
+            .and_then(|r| r.with_guessed_format().ok())
+            .and_then(|r| r.format()),
+        Some(image::ImageFormat::OpenExr) | Some(image::ImageFormat::Hdr)
+    )
+}
+
+/// HDR / EXR 解碼：保留 f16 浮點原始資料，並以預設曝光做色調映射後顯示。
+///
+/// 之前的做法是直接 `into_rgba8()`——那只是把線性值截斷成 0–255、
+/// 完全沒做 gamma，而 egui 又把結果當 sRGB 解讀，導致整張明顯偏暗，
+/// 同時亮部細節全部糊成一片白。
+fn decode_hdr(
+    path: &Path,
+    file_size: u64,
+    generation: u64,
+    send: &dyn Fn(LoadEvent),
+) -> Result<Decoded, String> {
+    let reader = ImageReader::open(path)
+        .map_err(|e| format!("無法開啟檔案：{e}"))?
+        .with_guessed_format()
+        .map_err(err_str)?;
+    let fmt = match reader.format() {
+        Some(image::ImageFormat::OpenExr) => "OpenEXR",
+        _ => "Radiance HDR",
+    };
+    let img = reader.decode().map_err(err_str)?;
+    let mut hdr = crate::hdr::from_dynamic(&img).ok_or("這個檔案沒有浮點像素資料")?;
+
+    // 超過貼圖上限時在浮點域縮小（先壓亮度再縮會讓高光邊緣出現暗環）
+    let max = max_tex_side() as usize;
+    while hdr.size[0] > max || hdr.size[1] > max {
+        hdr = hdr.halved();
+    }
+
+    let orig_size = [hdr.size[0] as u32, hdr.size[1] as u32];
+    let meta = ImageMeta {
+        path: path.to_path_buf(),
+        orig_size,
+        file_size,
+        format: fmt.to_owned(),
+        animated: false,
+        has_alpha: true,
+    };
+    send(LoadEvent::Meta {
+        generation,
+        meta: meta.clone(),
+    });
+
+    let lut = crate::hdr::ToneLut::build(0.0, crate::hdr::ToneOp::Aces);
+    let base = Arc::new(crate::hdr::tonemap(&hdr, &lut));
+    let frame = FrameData {
+        image: base.clone(),
+        delay: Duration::ZERO,
+    };
+    send(LoadEvent::Frame {
+        generation,
+        index: 0,
+        frame: frame.clone(),
+    });
+    let mips = build_mips(base);
+    send(LoadEvent::Mips {
+        generation,
+        mips: mips.clone(),
+    });
+
+    let hdr = Arc::new(hdr);
+    let bytes = Decoded::compute_bytes_with_hdr(std::slice::from_ref(&frame), &mips, Some(&hdr));
+    Ok(Decoded {
+        hdr: Some(hdr),
+        meta,
+        frames: vec![frame],
+        mips,
+        complete: true,
+        truncated: false,
+        bytes,
+    })
 }
 
 /// 只讀標頭取得 EXIF 方向
@@ -512,6 +601,7 @@ fn decode_raw_progressive(
                 // 預覽已是全解析度等級，不必再花 CPU 顯影
                 let bytes = Decoded::compute_bytes(std::slice::from_ref(&r.1), &r.2);
                 return Ok(Decoded {
+                    hdr: None,
                     meta: r.0,
                     frames: vec![r.1],
                     mips: r.2,
@@ -528,6 +618,7 @@ fn decode_raw_progressive(
             let r = emit(rgba, "RAW");
             let bytes = Decoded::compute_bytes(std::slice::from_ref(&r.1), &r.2);
             return Ok(Decoded {
+                hdr: None,
                 meta: r.0,
                 frames: vec![r.1],
                 mips: r.2,
@@ -551,6 +642,7 @@ fn decode_raw_progressive(
 
     let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
     Ok(Decoded {
+        hdr: None,
         meta,
         frames: vec![frame],
         mips,
@@ -562,6 +654,11 @@ fn decode_raw_progressive(
 
 /// 預載：靜態圖全解（含 mip 鏈）；動畫只解第一格，翻到時再全解。
 fn decode_prefetch(path: &Path) -> Result<Decoded, String> {
+    // HDR 需要保留浮點資料與色調映射，預載路徑不處理；
+    // 使用者真的翻到時會由高優先權工作走完整流程（這類檔案本來就少見）
+    if is_hdr_file(path) {
+        return Err("HDR 不預載".into());
+    }
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let ext = ext_lower(path);
     let ignore = |_: LoadEvent| {};
@@ -609,6 +706,7 @@ fn decode_prefetch(path: &Path) -> Result<Decoded, String> {
         let mips = build_mips(base);
         let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
         Ok(Decoded {
+            hdr: None,
             meta: ImageMeta {
                 path: path.to_path_buf(),
                 orig_size,
@@ -762,6 +860,7 @@ fn decode_animation(
 
     let bytes = Decoded::compute_bytes(&frames, &mips);
     Ok(Decoded {
+        hdr: None,
         meta,
         frames,
         mips,
