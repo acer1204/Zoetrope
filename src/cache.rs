@@ -106,10 +106,7 @@ mod tests {
 
     fn dummy(bytes_px: usize) -> Arc<Decoded> {
         let img = Arc::new(ColorImage::new([bytes_px, 1], eframe::egui::Color32::BLACK));
-        let frames = vec![FrameData {
-            image: img.clone(),
-            delay: Duration::ZERO,
-        }];
+        let frames = vec![FrameData::new(img.clone(), Duration::ZERO)];
         let bytes = Decoded::compute_bytes(&frames, &[]);
         Arc::new(Decoded {
             hdr: None,

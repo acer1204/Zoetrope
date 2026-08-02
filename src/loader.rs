@@ -289,10 +289,7 @@ fn decode_streaming(
         });
 
         let base = Arc::new(to_color_image_clamped(rgba));
-        let frame = FrameData {
-            image: base.clone(),
-            delay: Duration::ZERO,
-        };
+        let frame = FrameData::new(base.clone(), Duration::ZERO);
         send(LoadEvent::Frame {
             generation,
             index: 0,
@@ -360,10 +357,7 @@ fn emit_static(
         meta: meta.clone(),
     });
     let base = Arc::new(to_color_image_clamped(rgba));
-    let frame = FrameData {
-        image: base.clone(),
-        delay: Duration::ZERO,
-    };
+    let frame = FrameData::new(base.clone(), Duration::ZERO);
     send(LoadEvent::Frame {
         generation,
         index: 0,
@@ -507,10 +501,7 @@ fn decode_hdr(
 
     let lut = crate::hdr::ToneLut::build(0.0, crate::hdr::ToneOp::Aces);
     let base = Arc::new(crate::hdr::tonemap(&hdr, &lut));
-    let frame = FrameData {
-        image: base.clone(),
-        delay: Duration::ZERO,
-    };
+    let frame = FrameData::new(base.clone(), Duration::ZERO);
     send(LoadEvent::Frame {
         generation,
         index: 0,
@@ -574,10 +565,7 @@ fn decode_raw_progressive(
             meta: meta.clone(),
         });
         let base = Arc::new(to_color_image_clamped(rgba));
-        let frame = FrameData {
-            image: base.clone(),
-            delay: Duration::ZERO,
-        };
+        let frame = FrameData::new(base.clone(), Duration::ZERO);
         send(LoadEvent::Frame {
             generation,
             index: 0,
@@ -699,10 +687,7 @@ fn decode_prefetch(path: &Path) -> Result<Decoded, String> {
         let orig_size = [rgba.width(), rgba.height()];
         let has_alpha = rgba_has_alpha(&rgba);
         let base = Arc::new(to_color_image_clamped(rgba));
-        let frame = FrameData {
-            image: base.clone(),
-            delay: Duration::ZERO,
-        };
+        let frame = FrameData::new(base.clone(), Duration::ZERO);
         let mips = build_mips(base);
         let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
         Ok(Decoded {
@@ -821,7 +806,16 @@ fn decode_animation(
             });
         }
         let ci = Arc::new(to_color_image_clamped(buf));
-        let fd = FrameData { image: ci, delay };
+        // 與前一格比對出變動矩形，讓 UI 端只需上傳變動的那一塊。
+        // 必須在 to_color_image_clamped 之後才算，否則座標會與貼圖對不上。
+        let dirty = frames
+            .last()
+            .and_then(|p: &FrameData| diff_rect(&p.image, &ci));
+        let fd = FrameData {
+            image: ci,
+            delay,
+            dirty,
+        };
         total_bytes += fd.bytes();
         send(LoadEvent::Frame {
             generation,
@@ -977,6 +971,50 @@ pub fn build_mips(base: Arc<ColorImage>) -> Vec<Arc<ColorImage>> {
         mips.push(Arc::new(half_color_image(last)));
     }
     mips
+}
+
+/// 計算兩張同尺寸影像的變動矩形 `[x, y, w, h]`。
+///
+/// 動畫（尤其 GIF）通常每格只有一小塊在變，算出這塊就能只上傳那一部分。
+/// 尺寸不同時回傳 None（呼叫端應整張重傳）；完全相同時回傳 `[0,0,0,0]`。
+///
+/// 成本是一次全畫布比對（逐列先用 slice 比較快速略過未變動的列），
+/// 800×600 約 60–100µs，發生在背景解碼執行緒且每格只做一次。
+pub fn diff_rect(a: &ColorImage, b: &ColorImage) -> Option<[usize; 4]> {
+    if a.size != b.size {
+        return None;
+    }
+    let [w, h] = a.size;
+    if w == 0 || h == 0 {
+        return Some([0, 0, 0, 0]);
+    }
+    let (mut min_x, mut min_y) = (w, h);
+    let (mut max_x, mut max_y) = (0usize, 0usize);
+    for y in 0..h {
+        let ra = &a.pixels[y * w..(y + 1) * w];
+        let rb = &b.pixels[y * w..(y + 1) * w];
+        if ra == rb {
+            continue; // 整列相同，快速略過
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        max_y = y;
+        let first = ra.iter().zip(rb).position(|(p, q)| p != q).unwrap_or(0);
+        let last = w
+            - 1
+            - ra.iter()
+                .rev()
+                .zip(rb.iter().rev())
+                .position(|(p, q)| p != q)
+                .unwrap_or(0);
+        min_x = min_x.min(first);
+        max_x = max_x.max(last);
+    }
+    if min_y > max_y {
+        return Some([0, 0, 0, 0]); // 完全相同
+    }
+    Some([min_x, min_y, max_x - min_x + 1, max_y - min_y + 1])
 }
 
 /// 2×2 箱形濾波減半（egui Color32，預乘 alpha 下逐通道平均即正確）

@@ -143,6 +143,48 @@ struct TexCache {
     anim: Option<egui::TextureHandle>,
     anim_frame: usize,
     anim_nearest: bool,
+    /// 貼圖上目前實際是哪一份影像。漸進式解碼可能就地替換 frames[k]，
+    /// 只靠索引記帳會與 GPU 內容脫節，必須用 Arc 身分比對。
+    anim_src: Option<Arc<eframe::egui::ColorImage>>,
+}
+
+/// 一次最多跨幾格還願意用部分更新；跨太多格時聯集會接近整張，不如整張重傳
+const MAX_PARTIAL_STEPS: usize = 4;
+/// 變動面積超過整張的這個比例就整張重傳（裁切也有成本）
+const PARTIAL_AREA_LIMIT: f32 = 0.6;
+
+/// 從影像裁出子矩形（ColorImage 的欄位是公開的，逐列 memcpy 即可）
+fn crop(src: &eframe::egui::ColorImage, r: [usize; 4]) -> eframe::egui::ColorImage {
+    let [sw, sh] = src.size;
+    let x = r[0].min(sw);
+    let y = r[1].min(sh);
+    let w = r[2].min(sw - x);
+    let h = r[3].min(sh - y);
+    let mut pixels = Vec::with_capacity(w * h);
+    for row in 0..h {
+        let s = (y + row) * sw + x;
+        pixels.extend_from_slice(&src.pixels[s..s + w]);
+    }
+    eframe::egui::ColorImage {
+        size: [w, h],
+        pixels,
+    }
+}
+
+/// 取兩個矩形的聯集；`None` 代表「未知，需整張重傳」，會蓋過一切
+fn union_rect(a: Option<[usize; 4]>, b: Option<[usize; 4]>) -> Option<[usize; 4]> {
+    let (a, b) = (a?, b?);
+    if a[2] == 0 || a[3] == 0 {
+        return Some(b);
+    }
+    if b[2] == 0 || b[3] == 0 {
+        return Some(a);
+    }
+    let x0 = a[0].min(b[0]);
+    let y0 = a[1].min(b[1]);
+    let x1 = (a[0] + a[2]).max(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).max(b[1] + b[3]);
+    Some([x0, y0, x1 - x0, y1 - y0])
 }
 
 struct CurrentImage {
@@ -359,10 +401,7 @@ impl ViewerApp {
         let Some(hdr) = cur.hdr.clone() else { return };
         let lut = crate::hdr::ToneLut::build(self.exposure_ev, self.tone_op);
         let base = Arc::new(crate::hdr::tonemap(&hdr, &lut));
-        cur.frames = vec![FrameData {
-            image: base.clone(),
-            delay: Duration::ZERO,
-        }];
+        cur.frames = vec![FrameData::new(base.clone(), Duration::ZERO)];
         cur.mips = crate::loader::build_mips(base);
         cur.tex.static_mips.clear(); // 讓貼圖重新上傳
     }
@@ -1152,21 +1191,74 @@ impl ViewerApp {
         if cur.frames.len() > 1 {
             let fi = frame_idx.min(cur.frames.len() - 1);
             let img = cur.frames[fi].image.clone();
-            match &mut cur.tex.anim {
-                None => {
-                    let tex = ctx.load_texture("anim", egui::ImageData::Color(img), opts(nearest));
-                    cur.tex.anim_frame = fi;
-                    cur.tex.anim_nearest = nearest;
-                    cur.tex.anim = Some(tex);
-                }
-                Some(tex) => {
-                    if cur.tex.anim_frame != fi || cur.tex.anim_nearest != nearest {
-                        tex.set(egui::ImageData::Color(img), opts(nearest));
-                        cur.tex.anim_frame = fi;
-                        cur.tex.anim_nearest = nearest;
+
+            // 首次配置：整張上傳
+            let Some(tex) = cur.tex.anim.as_mut() else {
+                let tex =
+                    ctx.load_texture("anim", egui::ImageData::Color(img.clone()), opts(nearest));
+                cur.tex.anim_frame = fi;
+                cur.tex.anim_nearest = nearest;
+                cur.tex.anim_src = Some(img);
+                cur.tex.anim = Some(tex);
+                return cur.tex.anim.as_ref().map(|t| t.id());
+            };
+
+            let prev_fi = cur.tex.anim_frame;
+            let same_filter = cur.tex.anim_nearest == nearest;
+            if prev_fi == fi && same_filter {
+                return Some(tex.id()); // 同一格，什麼都不用做
+            }
+
+            // 只在「單向前進、步數不多、貼圖內容確實是我們記的那一格」時
+            // 才做部分更新——這是正確性前提，不是最佳化選項。
+            // 倒退播放、跨大步（休眠後追格）、切換取樣模式一律整張重傳。
+            let src_ok = cur.tex.anim_src.as_ref().is_some_and(|s| {
+                cur.frames
+                    .get(prev_fi)
+                    .is_some_and(|f| Arc::ptr_eq(s, &f.image))
+            });
+            let forward_small = fi > prev_fi && fi - prev_fi <= MAX_PARTIAL_STEPS;
+            let size_ok = cur
+                .frames
+                .get(prev_fi)
+                .is_some_and(|f| f.image.size == img.size);
+
+            let mut rect = None;
+            if same_filter && src_ok && forward_small && size_ok {
+                // 聯集 prev_fi+1..=fi 各格的變動矩形
+                let mut acc = Some([0usize; 4]);
+                for k in (prev_fi + 1)..=fi {
+                    acc = union_rect(acc, cur.frames[k].dirty);
+                    if acc.is_none() {
+                        break;
                     }
                 }
+                let [w, h] = img.size;
+                rect = acc.filter(|r| {
+                    // 自行做邊界檢查：epaint 的檢查是 debug_assert，release 不會擋，
+                    // 越界的部分更新會直接觸發 wgpu 驗證錯誤
+                    let in_bounds = r[0] + r[2] <= w && r[1] + r[3] <= h;
+                    let area = (r[2] * r[3]) as f32;
+                    let full = (w * h).max(1) as f32;
+                    in_bounds && area <= full * PARTIAL_AREA_LIMIT
+                });
             }
+
+            match rect {
+                // 完全沒變動：連上傳都不用
+                Some([_, _, 0, 0]) => {}
+                Some(r) => {
+                    tex.set_partial(
+                        [r[0], r[1]],
+                        egui::ImageData::Color(Arc::new(crop(&img, r))),
+                        opts(nearest),
+                    );
+                }
+                None => tex.set(egui::ImageData::Color(img.clone()), opts(nearest)),
+            }
+            cur.tex.anim_frame = fi;
+            cur.tex.anim_nearest = nearest;
+            cur.tex.anim_src = Some(img);
             return cur.tex.anim.as_ref().map(|t| t.id());
         }
 

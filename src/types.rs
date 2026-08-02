@@ -28,9 +28,25 @@ pub struct FileEntry {
 pub struct FrameData {
     pub image: Arc<ColorImage>,
     pub delay: Duration,
+    /// 相對「前一格」的變動矩形 `[x, y, w, h]`，供部分貼圖更新使用。
+    ///
+    /// - `None`：未知，必須整張重傳
+    /// - `Some([_, _, 0, 0])`：與前一格完全相同，不必上傳
+    ///
+    /// 動畫（尤其 GIF）通常每格只有一小塊在變，只傳那一塊可省下大量頻寬。
+    pub dirty: Option<[usize; 4]>,
 }
 
 impl FrameData {
+    /// 一般建構：預設為「整張重傳」
+    pub fn new(image: Arc<ColorImage>, delay: Duration) -> Self {
+        Self {
+            image,
+            delay,
+            dirty: None,
+        }
+    }
+
     pub fn bytes(&self) -> usize {
         self.image.pixels.len() * 4
     }
