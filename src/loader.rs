@@ -246,6 +246,11 @@ fn decode_streaming(
         return decode_raw_progressive(path, file_size, generation, latest_gen, send);
     }
 
+    // JPEG XR（Windows HDR 截圖）：HDR 來源併入色調映射路徑
+    if is_jxr(path) {
+        return decode_jxr(path, file_size, generation, send);
+    }
+
     // HDR / EXR：保留浮點資料，套色調映射後才顯示
     if is_hdr_file(path) {
         return decode_hdr(path, file_size, generation, send);
@@ -447,6 +452,105 @@ fn decode_jpeg_progressive(
     }))
 }
 
+/// JPEG XR：副檔名或檔頭（`II` + 0xBC，與一般 TIFF 的 `II` + 42 不同）
+fn is_jxr(path: &Path) -> bool {
+    if crate::jxr::is_jxr_path(path) {
+        return true;
+    }
+    let mut head = [0u8; 4];
+    File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut head)
+        })
+        .is_ok()
+        && crate::jxr::is_jxr_header(&head)
+}
+
+/// JPEG XR 解碼。HDR 來源（Windows 遊戲列的 HDR 截圖）走與 EXR 相同的
+/// 色調映射路徑，因此同樣支援曝光調整。
+fn decode_jxr(
+    path: &Path,
+    file_size: u64,
+    generation: u64,
+    send: &dyn Fn(LoadEvent),
+) -> Result<Decoded, String> {
+    match crate::jxr::decode(path)? {
+        crate::jxr::JxrImage::Hdr(mut hdr) => {
+            let max = max_tex_side() as usize;
+            while hdr.size[0] > max || hdr.size[1] > max {
+                hdr = hdr.halved();
+            }
+            emit_hdr(hdr, path, file_size, "JPEG XR (HDR)", generation, send)
+        }
+        crate::jxr::JxrImage::Sdr(rgba) => {
+            let orig_size = [rgba.width(), rgba.height()];
+            let (meta, frame, mips) = emit_static(
+                path, rgba, orig_size, file_size, "JPEG XR", generation, send,
+            );
+            let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
+            Ok(Decoded {
+                hdr: None,
+                meta,
+                frames: vec![frame],
+                mips,
+                complete: true,
+                truncated: false,
+                bytes,
+            })
+        }
+    }
+}
+
+/// 送出 HDR 影像的事件組並組出 Decoded（EXR 與 JXR 共用）
+fn emit_hdr(
+    hdr: crate::hdr::HdrImage,
+    path: &Path,
+    file_size: u64,
+    fmt: &str,
+    generation: u64,
+    send: &dyn Fn(LoadEvent),
+) -> Result<Decoded, String> {
+    let meta = ImageMeta {
+        path: path.to_path_buf(),
+        orig_size: [hdr.size[0] as u32, hdr.size[1] as u32],
+        file_size,
+        format: fmt.to_owned(),
+        animated: false,
+        has_alpha: true,
+    };
+    send(LoadEvent::Meta {
+        generation,
+        meta: meta.clone(),
+    });
+
+    let lut = crate::hdr::ToneLut::build(0.0, crate::hdr::ToneOp::Aces);
+    let base = Arc::new(crate::hdr::tonemap(&hdr, &lut));
+    let frame = FrameData::new(base.clone(), Duration::ZERO);
+    send(LoadEvent::Frame {
+        generation,
+        index: 0,
+        frame: frame.clone(),
+    });
+    let mips = build_mips(base);
+    send(LoadEvent::Mips {
+        generation,
+        mips: mips.clone(),
+    });
+
+    let hdr = Arc::new(hdr);
+    let bytes = Decoded::compute_bytes_with_hdr(std::slice::from_ref(&frame), &mips, Some(&hdr));
+    Ok(Decoded {
+        hdr: Some(hdr),
+        meta,
+        frames: vec![frame],
+        mips,
+        complete: true,
+        truncated: false,
+        bytes,
+    })
+}
+
 fn is_hdr_file(path: &Path) -> bool {
     matches!(
         ImageReader::open(path)
@@ -644,7 +748,7 @@ fn decode_raw_progressive(
 fn decode_prefetch(path: &Path) -> Result<Decoded, String> {
     // HDR 需要保留浮點資料與色調映射，預載路徑不處理；
     // 使用者真的翻到時會由高優先權工作走完整流程（這類檔案本來就少見）
-    if is_hdr_file(path) {
+    if is_jxr(path) || is_hdr_file(path) {
         return Err("HDR 不預載".into());
     }
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);

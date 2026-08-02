@@ -15,6 +15,7 @@ pub static EXTS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::n
     let mut v: Vec<&'static str> = BASE_EXTS.to_vec();
     v.extend_from_slice(crate::extra_formats::MODERN_EXTS);
     v.extend_from_slice(crate::extra_formats::RAW_EXTS);
+    v.extend_from_slice(crate::jxr::JXR_EXTS);
     v
 });
 

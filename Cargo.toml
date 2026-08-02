@@ -28,6 +28,16 @@ heic = { version = "0.1", features = ["av1"] }      # HEIC/HEIF（HEVC）+ AVIF
 rawloader = "0.37"                                  # 相機 RAW：CR2/NEF/ARW/DNG…
 imagepipe = "0.5"                                   # RAW → sRGB 影像管線
 
+# JPEG XR（.jxr）走 Windows 內建的 WIC——原生支援、純 Rust 綁定、
+# 不需要任何 C 建置（jpegxr crate 需要 libclang 與 MSVC SAL 修補）
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+] }
+
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 

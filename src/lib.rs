@@ -5,6 +5,7 @@ pub mod dirlist;
 pub mod extra_formats;
 pub mod hdr;
 pub mod jpeg_fast;
+pub mod jxr;
 pub mod loader;
 pub mod raw_preview;
 pub mod samplegen;
