@@ -5,6 +5,10 @@ Cargo.lock.orig
 # 本機建置設定（含機器專屬的絕對路徑，不應進版控）
 /.cargo/config.toml
 
+# CI 設定：GitHub 要求推送 workflow 檔需有 `workflow` OAuth scope。
+# 執行 `gh auth refresh -h github.com -s workflow` 授權後，把這行刪掉即可納入版控。
+/.github/workflows/
+
 # 建置產物
 /Zoetrope.exe
 /zoetrope

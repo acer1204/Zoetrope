@@ -97,10 +97,22 @@ fn misnamed_jpeg_as_png_decodes() {
 
 #[test]
 fn clamp_oversized_texture() {
-    // 超過貼圖上限的圖要被縮到上限以內
+    // 預設上限（尚未由 UI 告知實際值）為 8192
+    loader::set_max_tex_side(8192);
     let big = image::RgbaImage::new(9000, 120);
     let ci = loader::to_color_image_clamped(big);
-    assert!(ci.size[0] <= zoetrope::types::MAX_TEX_DIM as usize);
+    assert!(ci.size[0] <= 8192);
     assert_eq!(ci.size[0], 4500);
     assert_eq!(ci.size[1], 60);
+
+    // 告知較高的上限後，同一張圖就不該被縮小
+    loader::set_max_tex_side(16384);
+    let big = image::RgbaImage::new(9000, 120);
+    let ci = loader::to_color_image_clamped(big);
+    assert_eq!(ci.size, [9000, 120], "16384 上限下 9000px 不應降階");
+
+    // 過小的值視為未初始化，應被忽略
+    loader::set_max_tex_side(64);
+    assert_eq!(loader::max_tex_side(), 16384);
+    loader::set_max_tex_side(8192); // 還原，避免影響其他測試
 }

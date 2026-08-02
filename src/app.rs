@@ -1522,6 +1522,9 @@ impl ViewerApp {
                         ui.label("繪圖後端");
                         ui.label(&self.renderer_label);
                         ui.end_row();
+                        ui.label("貼圖上限");
+                        ui.label(format!("{0} × {0} px", crate::loader::max_tex_side()));
+                        ui.end_row();
                     });
                 } else {
                     ui.label("尚未開啟圖片");
@@ -1548,6 +1551,12 @@ impl eframe::App for ViewerApp {
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // 把實際的 GPU 貼圖上限告訴解碼執行緒（egui 在第一幀後才知道真值）
+        let side = ctx.input(|i| i.max_texture_side) as u32;
+        if cfg!(debug_assertions) && side != crate::loader::max_tex_side() {
+            eprintln!("[zoetrope] max_texture_side = {side}");
+        }
+        crate::loader::set_max_tex_side(side);
         self.process_events(ctx);
         self.handle_input(ctx);
         self.advance_animation(ctx);

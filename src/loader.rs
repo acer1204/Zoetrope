@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -813,9 +813,26 @@ fn rgba_has_alpha(img: &RgbaImage) -> bool {
     img.as_raw().chunks_exact(4).any(|p| p[3] != 255)
 }
 
+/// 執行時偵測到的 GPU 貼圖邊長上限。UI 執行緒在每幀更新，
+/// 解碼執行緒讀取——用 atomic 避免額外的鎖。
+static MAX_TEX_SIDE: AtomicU32 = AtomicU32::new(MAX_TEX_DIM);
+
+/// 由 UI 端告知實際的貼圖上限（`ctx.input(|i| i.max_texture_side)`）
+pub fn set_max_tex_side(side: u32) {
+    // 太小的值必然是還沒初始化完成，忽略以免把圖縮爛
+    if side >= 2048 {
+        MAX_TEX_SIDE.store(side, AtomicOrdering::Relaxed);
+    }
+}
+
+pub fn max_tex_side() -> u32 {
+    MAX_TEX_SIDE.load(AtomicOrdering::Relaxed)
+}
+
 /// RgbaImage → egui ColorImage；超過 GPU 貼圖上限就逐次減半。
 pub fn to_color_image_clamped(mut rgba: RgbaImage) -> ColorImage {
-    while rgba.width() > MAX_TEX_DIM || rgba.height() > MAX_TEX_DIM {
+    let max = max_tex_side();
+    while rgba.width() > max || rgba.height() > max {
         rgba = half_rgba(&rgba);
     }
     let size = [rgba.width() as usize, rgba.height() as usize];

@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use eframe::egui::ColorImage;
 
-/// 單一 GPU 貼圖的最大邊長（超過就先縮小，避免超出 wgpu/GL 貼圖上限）
+/// GPU 貼圖邊長的保守預設值。實際上限在執行時由
+/// `ctx.input(|i| i.max_texture_side)` 取得（見 Loader::set_max_tex_side），
+/// 這個常數只在還沒問到之前當作起始值。
 pub const MAX_TEX_DIM: u32 = 8192;
 /// 單一動畫解碼後的記憶體保護上限（超過就停止解碼後續影格）
 pub const ANIM_BUDGET_BYTES: usize = 3 * 1024 * 1024 * 1024;
