@@ -20,6 +20,28 @@
 
 use eframe::egui::ColorImage;
 
+/// HDR 來源的參考基準。**這決定了正確的預設色調映射**，用錯會整張偏亮發灰。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HdrKind {
+    /// **顯示參考**（scRGB）：Windows 遊戲列與 NVIDIA 的 HDR 截圖屬於此類。
+    /// 1.0 就是 SDR 白（80 nits），超過的部分是 HDR 螢幕才顯示得出的高光。
+    /// 正確做法是直接截斷到 0–1 再做 sRGB 編碼——這正是 Windows 相簿的行為，
+    /// 套 ACES 反而會把中間調整體拉亮。
+    DisplayReferred,
+    /// **場景參考**（OpenEXR、Radiance HDR）：1.0 只是任意的中間值，
+    /// 真實亮度可達數十倍，必須經色調映射才能塞進螢幕範圍。
+    SceneReferred,
+}
+
+impl HdrKind {
+    pub fn default_tone_op(self) -> ToneOp {
+        match self {
+            HdrKind::DisplayReferred => ToneOp::Clip,
+            HdrKind::SceneReferred => ToneOp::Aces,
+        }
+    }
+}
+
 /// 以 f16 保存的 HDR 影像（RGBA，每像素 4 個 u16 bit pattern）。
 /// f16 相對 f32 省一半記憶體，精度對顯示用途綽綽有餘，
 /// 且正好是 GPU `Rgba16Float` 的原生佈局。
@@ -27,6 +49,7 @@ pub struct HdrImage {
     pub size: [usize; 2],
     /// RGBA 交錯，長度 = w × h × 4
     pub px: Vec<u16>,
+    pub kind: HdrKind,
 }
 
 impl HdrImage {
@@ -57,7 +80,11 @@ impl HdrImage {
                 }
             }
         }
-        HdrImage { size: [nw, nh], px }
+        HdrImage {
+            size: [nw, nh],
+            px,
+            kind: self.kind,
+        }
     }
 }
 
@@ -73,7 +100,7 @@ pub fn f32_to_f16(v: f32) -> u16 {
 
 /// 色調映射運算子。全部都是「逐通道」形式，才能塌縮成一維查表——
 /// 像 Khronos PBR Neutral 那種需要 min/max(rgb) 的運算子無法用 LUT。
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ToneOp {
     /// Narkowicz 的 ACES 近似式，電影感、高光滾降自然（預設）
     Aces,
@@ -169,7 +196,8 @@ pub fn tonemap(hdr: &HdrImage, lut: &ToneLut) -> ColorImage {
     ColorImage::from_rgba_unmultiplied([w, h], &out)
 }
 
-/// DynamicImage 的浮點變體 → HdrImage。非浮點格式回傳 None。
+/// DynamicImage 的浮點變體 → HdrImage（EXR/Radiance 皆為場景參考）。
+/// 非浮點格式回傳 None。
 pub fn from_dynamic(img: &image::DynamicImage) -> Option<HdrImage> {
     use image::DynamicImage as D;
     let (w, h) = match img {
@@ -196,7 +224,11 @@ pub fn from_dynamic(img: &image::DynamicImage) -> Option<HdrImage> {
         }
         _ => unreachable!(),
     }
-    Some(HdrImage { size: [w, h], px })
+    Some(HdrImage {
+        size: [w, h],
+        px,
+        kind: HdrKind::SceneReferred,
+    })
 }
 
 #[cfg(test)]
@@ -213,6 +245,7 @@ mod tests {
         HdrImage {
             size: [w, px.len() / w],
             px: v,
+            kind: HdrKind::SceneReferred,
         }
     }
 
