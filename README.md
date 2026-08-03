@@ -32,11 +32,8 @@ Windows / macOS / Linux 同一套程式碼。
 - **Mip 鏈縮圖**：縮小檢視大圖時自動選擇適當解析度層，無鋸齒、無閃爍
 - **記憶體有預算**：解碼快取 1.5 GB LRU 淘汰；單一動畫超過 3 GB 自動截斷保護；
   動畫播放共用一張 GPU 貼圖逐格更新，不會吃爆 VRAM
-- **廣泛格式**：JPEG（含 EXIF 自動轉向）、PNG / APNG、GIF、WebP（靜態＋動畫）、
-  BMP、TIFF、ICO、TGA、QOI、HDR、EXR、PNM、DDS、farbfeld，
-  以及 **JPEG XL、AVIF、HEIC/HEIF、相機 RAW**（CR2/CR3/NEF/ARW/DNG…）——
-  全部純 Rust 解碼，**不需要安裝任何 C 函式庫或系統擴充功能**；
-  Windows 另支援 **JPEG XR**（`.jxr`，遊戲列的 HDR 截圖格式）
+- **廣泛格式**：常見格式之外，另支援 JPEG XL、AVIF、HEIC/HEIF、相機 RAW，
+  全部純 Rust 解碼，**不需要安裝任何 C 函式庫或系統擴充功能**（詳見下方格式表）
 - **HDR 正確顯示**：EXR / Radiance HDR / JXR 保留浮點資料，以 ACES 曲線
   色調映射，並提供即時曝光補償（±6 EV，拉滑桿約 5ms，不需重新解碼）
 - **膠捲條**：滑鼠移到底部浮出橫向縮圖列，點選即可跳轉。只為可見格子
@@ -45,6 +42,40 @@ Windows / macOS / Linux 同一套程式碼。
 - **內容偵測**：以檔頭判斷真實格式，副檔名標錯（例如 JPEG 存成 `.png`）也能正常開啟
 - **RAW 漸進式載入**：先抽相機內嵌的 JPEG 預覽（13–90ms）立即顯示，
   預覽解析度不足時才在背景補上完整 demosaic 顯影並無縫替換
+
+## 支援格式
+
+除了一項例外，所有格式在 **Windows / macOS / Linux 上行為完全相同**。
+
+| 格式 | 副檔名 | 平台 | 備註 |
+|---|---|---|---|
+| JPEG | `.jpg` `.jpeg` `.jpe` `.jfif` | 全平台 | 自動套用 EXIF 方向；6 MP 以上採漸進式解碼 |
+| PNG / APNG | `.png` `.apng` | 全平台 | 自動偵測是否含動畫 |
+| GIF | `.gif` | 全平台 | 串流解碼、部分貼圖更新 |
+| WebP | `.webp` | 全平台 | 靜態與動畫皆可 |
+| BMP · TIFF · ICO · TGA · QOI · PNM · DDS · farbfeld | — | 全平台 | |
+| **JPEG XL** | `.jxl` | 全平台 | 純 Rust（jxl-oxide） |
+| **AVIF** | `.avif` `.avifs` | 全平台 | 動畫 AVIF 只顯示第一格 |
+| **HEIC / HEIF** | `.heic` `.heif` `.hif` | 全平台 | 純 Rust HEVC 解碼，免安裝系統擴充功能 |
+| **相機 RAW** | `.cr2` `.cr3` `.nef` `.arw` `.dng` 等 23 種 | 全平台 | 內嵌預覽優先，必要時背景補完整顯影 |
+| **Radiance HDR** | `.hdr` | 全平台 | 保留浮點，ACES 色調映射 + 曝光補償 |
+| **OpenEXR** | `.exr` | 全平台 | 同上 |
+| **JPEG XR** | `.jxr` `.wdp` | **僅 Windows** | 遊戲列 HDR 截圖格式；走系統內建的 WIC |
+
+### 關於 JPEG XR 的平台限制
+
+JPEG XR（Microsoft HD Photo）是 Windows 遊戲列（`Win+Alt+PrtScn`）在 HDR
+模式下的截圖格式。Zoetrope 走 **Windows 內建的 WIC** 解碼——這是作業系統
+原生支援，純 Rust 綁定、零 C 建置負擔。
+
+唯一的跨平台替代方案是 `jpegxr` crate（綁 Microsoft 的 C 版 jxrlib），但它
+要求每位建置者安裝 **libclang**，並自行修補 MSVC 專屬的 SAL 標註——為了一種
+幾乎只在 Windows 生態出現的格式，這個代價不合理。
+
+**這不影響其他任何格式**：`windows` 相依項宣告在 `[target.'cfg(windows)']`
+底下，macOS 與 Linux 的相依樹中完全不存在（可用
+`cargo tree --target x86_64-unknown-linux-gnu` 驗證）。在非 Windows 平台開啟
+`.jxr` 會顯示明確的不支援訊息，不會當掉。
 
 ## 安裝
 
