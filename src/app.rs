@@ -1553,6 +1553,7 @@ impl ViewerApp {
                         ui.separator();
                         ui.label("色調映射");
                         for op in [
+                            crate::hdr::ToneOp::Soft,
                             crate::hdr::ToneOp::Aces,
                             crate::hdr::ToneOp::Reinhard,
                             crate::hdr::ToneOp::Clip,

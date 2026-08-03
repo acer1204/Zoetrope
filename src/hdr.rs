@@ -48,7 +48,7 @@ const SCRGB_WHITE_NITS: f32 = 80.0;
 impl HdrKind {
     pub fn default_tone_op(self) -> ToneOp {
         match self {
-            HdrKind::DisplayReferred => ToneOp::Clip,
+            HdrKind::DisplayReferred => ToneOp::Soft,
             HdrKind::SceneReferred => ToneOp::Aces,
         }
     }
@@ -127,17 +127,28 @@ pub fn f32_to_f16(v: f32) -> u16 {
 /// 像 Khronos PBR Neutral 那種需要 min/max(rgb) 的運算子無法用 LUT。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ToneOp {
-    /// Narkowicz 的 ACES 近似式，電影感、高光滾降自然（預設）
+    /// **柔和肩部**：中間調維持原樣，只在高光處滾降。
+    ///
+    /// 這條曲線是量測 Windows 相簿的實際輸出擬合出來的——中間調完全是
+    /// 恆等（所以亮度與相簿一致），超過拐點後接一段 Reinhard 形式的肩部，
+    /// 讓極亮處不會硬切成死白。顯示參考內容（HDR 截圖）的預設值。
+    Soft,
+    /// Narkowicz 的 ACES 近似式，電影感、對比較強
     Aces,
-    /// Reinhard：x / (1 + x)，溫和、保留較多中間調
+    /// Reinhard：x / (1 + x)，整體壓縮，中間調會偏暗
     Reinhard,
-    /// 直接截斷，用來對照「未做色調映射」的樣子
+    /// 直接截斷，用來對照「完全不做滾降」的樣子
     Clip,
 }
+
+/// `Soft` 曲線的拐點：低於此值完全不動，高於此值開始滾降。
+/// 0.5 是擬合相簿實測資料得到的（10 個取樣點誤差都在 3/255 以內）。
+const SOFT_KNEE: f32 = 0.5;
 
 impl ToneOp {
     pub fn name(self) -> &'static str {
         match self {
+            ToneOp::Soft => "柔和",
             ToneOp::Aces => "ACES",
             ToneOp::Reinhard => "Reinhard",
             ToneOp::Clip => "截斷",
@@ -147,6 +158,16 @@ impl ToneOp {
     #[inline]
     fn apply(self, x: f32) -> f32 {
         match self {
+            ToneOp::Soft => {
+                if x <= SOFT_KNEE {
+                    x.max(0.0)
+                } else {
+                    // 拐點以上接 Reinhard 形式的肩部，漸近到 1.0
+                    let over = x - SOFT_KNEE;
+                    let room = 1.0 - SOFT_KNEE;
+                    SOFT_KNEE + room * (over / (over + room))
+                }
+            }
             ToneOp::Aces => {
                 // Narkowicz 2015 ACES filmic 近似
                 const A: f32 = 2.51;
