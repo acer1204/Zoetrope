@@ -35,7 +35,8 @@ fn main() {
     };
 
     let ev = img.kind.default_exposure_ev();
-    let op = img.kind.default_tone_op();
+    // 依內容挑的曲線：來源若根本沒用到高光空間就不套肩部
+    let op = img.recommended_tone_op();
     println!(
         "檔案      {}",
         p.file_name().unwrap_or_default().to_string_lossy()

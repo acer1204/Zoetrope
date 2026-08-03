@@ -93,9 +93,56 @@ pub struct HdrImage {
     pub kind: HdrKind,
 }
 
+/// 內容要超過螢幕白這麼多倍，才值得為它套肩部曲線。
+/// 1.1 大約是 0.14 格光圈——低於這個就沒有東西可壓縮。
+const SDR_HEADROOM_MIN: f32 = 1.1;
+/// 超過門檻的像素要佔到這個比例，才算「這張圖真的有 HDR」。
+/// 0.1% 等同看 p99.9，單一顆雜訊像素不會讓整張圖誤判。
+const HDR_PIXEL_FRACTION: f64 = 0.001;
+
 impl HdrImage {
     pub fn bytes(&self) -> usize {
         self.px.len() * 2
+    }
+
+    /// 依內容**實際用到多少高光空間**挑曲線。
+    ///
+    /// 顯示參考的來源不一定真的有 HDR。在 HDR 桌面上擷取的截圖，整張其實是
+    /// SDR 內容裝在 HDR 容器裡——實測一張這種檔案，峰值只有 scRGB 3.0，
+    /// 剛好貼著螢幕白階（2.83 = 226 nits）。對這種檔案套肩部曲線是有害的：
+    /// 曲線的拐點落在白階的一半，於是 UI 的底色與文字被一起壓進很窄的範圍，
+    /// 兩個相差 17 階的灰只剩 8 階，畫面讀起來就是一片過曝、看不清楚。
+    /// 改用截斷則會逐位元重現原本的桌面畫面。
+    ///
+    /// 判斷方式刻意用「超過門檻的像素佔比」而不是最大值：單一顆過亮的雜訊
+    /// 像素不該讓整張圖改走另一條曲線。
+    pub fn recommended_tone_op(&self) -> ToneOp {
+        let base = self.kind.default_tone_op();
+        // 場景參考（EXR）沒有固定的白點基準，這個判斷對它沒有意義
+        if self.kind != HdrKind::DisplayReferred {
+            return base;
+        }
+        let n = self.px.len() / 4;
+        if n == 0 {
+            return base;
+        }
+        let gain = 2f32.powf(self.kind.default_exposure_ev());
+        // 直接比 f16 的 bit pattern：非負有限值的位元序等同數值序
+        let cutoff = f32_to_f16(SDR_HEADROOM_MIN / gain);
+        let step = n.div_ceil(200_000).max(1);
+
+        let mut over = 0usize;
+        let mut total = 0usize;
+        for c in self.px.chunks_exact(4).step_by(step) {
+            let m = san_bits(c[0]).max(san_bits(c[1])).max(san_bits(c[2]));
+            total += 1;
+            over += usize::from(m > cutoff);
+        }
+        if (over as f64) < total as f64 * HDR_PIXEL_FRACTION {
+            ToneOp::Clip
+        } else {
+            base
+        }
     }
 
     /// 2×2 箱形濾波減半（在浮點域做，避免先壓縮亮度再縮小造成高光錯誤）
