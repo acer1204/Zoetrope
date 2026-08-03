@@ -287,9 +287,16 @@ impl ViewerApp {
         let cache = Arc::new(Mutex::new(Cache::default()));
         let loader = Loader::new(cc.egui_ctx.clone(), cache);
         // 記下**實際**的後端與輸出格式，而不是編譯期猜的清單。
-        // egui-wgpu 只會挑 8-bit 的 Rgba8Unorm/Bgra8Unorm，而 wgpu 22 的 DX12
-        // 後端從來不呼叫 SetColorSpace1，所以即使 Windows 開了 HDR，我們仍然是
-        // 一般的 SDR 視窗、由系統合成——問「現在是不是 HDR 輸出」時看這裡。
+        //
+        // 目前一定是 8-bit：egui-wgpu 的 preferred_framebuffer_format 只認
+        // Rgba8Unorm/Bgra8Unorm，而 WgpuConfiguration 沒有可以覆寫的欄位。
+        // 所以就算 Windows 開了 HDR，我們仍然是一般的 SDR 視窗、由系統合成。
+        //
+        // 擋路的**只有** egui-wgpu 這一層，不是 wgpu：把 surface 設成
+        // Rgba16Float 之後，Vulkan 後端會給 EXTENDED_SRGB_LINEAR_EXT
+        // （wgpu-hal/src/vulkan/device.rs:544），DX12 則因為 DXGI 對浮點
+        // swapchain 的預設色彩空間就是 scRGB 而不需要額外設定。
+        // 要判斷「現在是不是 HDR 輸出」，看這個欄位即可。
         let renderer_label = match cc.wgpu_render_state.as_ref() {
             Some(rs) => {
                 let info = rs.adapter.get_info();
@@ -411,10 +418,10 @@ impl ViewerApp {
 
     /// 把影像換到畫面上（重置播放狀態），並結束等待中的載入
     fn show(&mut self, img: CurrentImage) {
-        // HDR 的預設曲線依來源而定（scRGB 截圖用截斷、EXR 用 ACES），
+        // HDR 的預設曲線依來源與內容而定（見 HdrImage::recommended_tone_op），
         // 換圖時一併重置曝光，避免上一張的設定套到不同性質的來源上
         if let Some(h) = &img.hdr {
-            self.tone_op = h.kind.default_tone_op();
+            self.tone_op = h.recommended_tone_op();
             self.exposure_ev = h.kind.default_exposure_ev();
         }
         self.current = Some(img);
@@ -632,7 +639,7 @@ impl ViewerApp {
                             if let Some(d) = self.loader.peek(&c.meta.path) {
                                 c.hdr = d.hdr.clone();
                                 if let Some(h) = &c.hdr {
-                                    self.tone_op = h.kind.default_tone_op();
+                                    self.tone_op = h.recommended_tone_op();
                                     self.exposure_ev = h.kind.default_exposure_ev();
                                 }
                             }

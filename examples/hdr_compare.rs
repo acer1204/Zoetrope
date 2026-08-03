@@ -1,4 +1,4 @@
-//! HDR 顯示診斷：比較各條色調映射曲線在同一張檔案上的輸出分佈。
+﻿//! HDR 顯示診斷：比較各條色調映射曲線在同一張檔案上的輸出分佈。
 //!
 //! 懷疑某張 HDR 圖顯示不正確時，跑這個把數據印出來，與其他看圖軟體
 //! （例如 Windows 相簿）的結果對照，就能判斷是不是設定不對，
@@ -35,7 +35,8 @@ fn main() {
     };
 
     let ev = img.kind.default_exposure_ev();
-    let op = img.kind.default_tone_op();
+    // 依內容挑的曲線：來源若根本沒用到高光空間就不套肩部
+    let op = img.recommended_tone_op();
     println!(
         "檔案      {}",
         p.file_name().unwrap_or_default().to_string_lossy()
@@ -66,6 +67,48 @@ fn main() {
         "超過 1.0 的像素：{:.1}%",
         100.0 * over1 as f64 / src.len() as f64
     );
+
+    // 中性亮部的分佈。桌面截圖在 HDR 模式下擷取時，畫面裡的「SDR 白」會落在
+    // SdrWhiteLevel/80 而不是 1.0，所以這裡的尖峰就是那台機器當下的白階，
+    // 可以拿來檢查我們寫死的紙白假設對不對。
+    // 每 1/4 格光圈一個 bin，只看 (max-min)/max < 3% 的中性像素。
+    let mut bins = [0u32; 40];
+    let mut neutral = 0u64;
+    for p in img.px.chunks_exact(4).step_by(11) {
+        let (r, g, b) = (
+            hdr::f16_to_f32(p[0]),
+            hdr::f16_to_f32(p[1]),
+            hdr::f16_to_f32(p[2]),
+        );
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        if max < 0.25 || !max.is_finite() || (max - min) / max > 0.03 {
+            continue;
+        }
+        neutral += 1;
+        // bin 0 對應 scRGB 0.25，每 bin 1/4 格光圈
+        let i = ((max / 0.25).log2() * 4.0).round();
+        if (0.0..bins.len() as f32).contains(&i) {
+            bins[i as usize] += 1;
+        }
+    }
+    if neutral > 0 {
+        let mut top: Vec<(usize, u32)> = bins.iter().copied().enumerate().collect();
+        top.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        println!(
+            "\n中性亮部（scRGB ≥ 0.25，色度差 <3%）：取樣中佔 {:.1}%",
+            100.0 * neutral as f64 / (img.px.len() / 4 / 11) as f64
+        );
+        println!("最集中的幾個亮度（→ 換算成 nits，scRGB 1.0 = 80 nits）：");
+        for (i, c) in top.iter().take(4).filter(|(_, c)| *c > 0) {
+            let v = 0.25 * 2f32.powf(*i as f32 / 4.0);
+            println!(
+                "  scRGB {v:6.3}  = {:6.0} nits   （{:.1}% 的中性像素）",
+                v * 80.0,
+                100.0 * *c as f64 / neutral as f64
+            );
+        }
+    }
 
     // 飽和度：(max-min)/max，在線性空間量。逐通道壓縮會把它拉低——
     // 這正是「膚色偏白」在數字上的樣子。

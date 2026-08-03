@@ -292,6 +292,109 @@ fn driver_treats_channels_symmetrically() {
     );
 }
 
+/// 依內容挑曲線：在 HDR 桌面上擷取的截圖，整張可能根本沒有 HDR。
+///
+/// 這組數值取自兩張真實的 NVIDIA 桌面截圖與一張遊戲截圖：
+///
+/// | 來源 | p99 | 峰值 | 該用的曲線 |
+/// |---|---|---|---|
+/// | 桌面截圖（純 UI） | 2.52 | **3.00** | 截斷——沒有高光可壓 |
+/// | 桌面截圖（含 HDR 視窗） | 7.37 | 13.68 | 柔和 |
+/// | 遊戲截圖 | 9.79 | 12.72 | 柔和 |
+///
+/// 第一張的峰值只有 3.0，剛好貼著螢幕白階（2.83 = 226 nits）。對它套肩部
+/// 曲線會把 UI 的底色與文字壓進很窄的範圍——實測兩個原本相差 17 階的灰只
+/// 剩 8 階，看起來就是一片過曝。
+fn peaky(peak: f32, fraction: f64, w: usize, h: usize) -> HdrImage {
+    // 底色固定在螢幕白階附近，只有指定比例的像素拉到 peak
+    let n = w * h;
+    let bright = ((n as f64) * fraction) as usize;
+    let mut px = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let v = if i < bright { peak } else { 2.0 };
+        for _ in 0..3 {
+            px.push(hdr::f32_to_f16(v));
+        }
+        px.push(hdr::f32_to_f16(1.0));
+    }
+    HdrImage {
+        size: [w, h],
+        px,
+        kind: HdrKind::DisplayReferred,
+    }
+}
+
+#[test]
+fn picks_clip_when_the_file_has_no_hdr_headroom() {
+    // 純 SDR 桌面截圖：峰值 3.0，貼著白階
+    assert_eq!(
+        peaky(3.0, 0.0, 200, 100).recommended_tone_op(),
+        ToneOp::Clip
+    );
+    // 含 HDR 內容的桌面截圖：峰值 13.68，且佔比夠大
+    assert_eq!(
+        peaky(13.68, 0.05, 200, 100).recommended_tone_op(),
+        ToneOp::Soft
+    );
+    // 遊戲截圖：大量像素在高光區
+    assert_eq!(
+        peaky(12.72, 0.3, 200, 100).recommended_tone_op(),
+        ToneOp::Soft
+    );
+}
+
+#[test]
+fn a_few_stray_bright_pixels_do_not_flip_the_curve() {
+    // 十萬分之一的過亮雜訊像素不該讓整張圖改走另一條曲線
+    assert_eq!(
+        peaky(60.0, 0.000_01, 400, 250).recommended_tone_op(),
+        ToneOp::Clip
+    );
+    // 但 1% 就確實是內容的一部分了
+    assert_eq!(
+        peaky(60.0, 0.01, 400, 250).recommended_tone_op(),
+        ToneOp::Soft
+    );
+}
+
+/// 場景參考的 EXR 沒有固定白點基準，這個判斷對它沒有意義，必須維持 ACES
+#[test]
+fn scene_referred_is_unaffected_by_content_detection() {
+    let dim = HdrImage {
+        size: [8, 8],
+        px: vec![hdr::f32_to_f16(0.05); 8 * 8 * 4],
+        kind: HdrKind::SceneReferred,
+    };
+    assert_eq!(dim.recommended_tone_op(), ToneOp::Aces);
+}
+
+/// 這是「文字與底色糊在一起」的數字版：桌面截圖裡最主要的兩個 UI 灰階，
+/// 在截斷之下必須完整保留原本的階差
+#[test]
+fn clip_reproduces_desktop_ui_contrast_that_the_shoulder_crushes() {
+    let kind = HdrKind::DisplayReferred;
+    let ev = kind.default_exposure_ev();
+    // 實測該檔案中佔比最高的兩個中性亮階（44.4% 與 43.2%）
+    let (a, b) = (2.0f32, 2.378);
+
+    let sep = |op: ToneOp| {
+        let lut = hdr::ToneLut::build(ev, op);
+        let g = |v: f32| hdr::tonemap(&single(v, kind), &lut).pixels[0].r();
+        g(b).abs_diff(g(a))
+    };
+
+    assert!(
+        sep(ToneOp::Clip) >= 15,
+        "截斷應保留約 17 階的差距，實際 {}",
+        sep(ToneOp::Clip)
+    );
+    assert!(
+        sep(ToneOp::Soft) <= 10,
+        "肩部確實會壓掉對比（這正是問題所在），實際 {}",
+        sep(ToneOp::Soft)
+    );
+}
+
 /// 保色度路徑要能安全處理壞資料與全黑像素（除以驅動量時的邊界）
 #[test]
 fn chroma_path_handles_black_and_bad_pixels() {
