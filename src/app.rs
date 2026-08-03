@@ -1732,6 +1732,9 @@ impl ViewerApp {
 
         if let Some(i) = clicked {
             self.nav_to(ctx, i);
+            // 使用者是直接點膠捲條選的，那一格本來就在他眼前——
+            // 這時再自動捲動只會讓畫面莫名其妙地跳掉
+            self.strip_scroll_to_current = false;
         }
     }
 
@@ -1745,18 +1748,22 @@ impl ViewerApp {
         let cur = self.index;
         let scroll_to = std::mem::take(&mut self.strip_scroll_to_current);
 
-        let mut area = egui::ScrollArea::horizontal()
+        let area = egui::ScrollArea::horizontal()
             .auto_shrink([false, false])
             .id_salt("filmstrip-scroll");
-        if scroll_to {
-            // 讓目前這格置中
-            let target = step * cur as f32 + cell_w * 0.5 - ui.available_width() * 0.5;
-            area = area.horizontal_scroll_offset(target.max(0.0));
-        }
 
         area.show_viewport(ui, |ui, viewport| {
             ui.set_width(total_w);
             ui.set_height(cell_h);
+
+            // 用鍵盤或滾輪翻頁時，把目前這格帶進可見範圍——但只捲動
+            // 「剛好足夠」的距離（align = None）。已經看得到就完全不動，
+            // 也不會強制置中。
+            if scroll_to {
+                let x0 = ui.min_rect().left() + step * cur as f32;
+                let target = Rect::from_x_y_ranges(x0..=(x0 + cell_w), ui.max_rect().y_range());
+                ui.scroll_to_rect(target, None);
+            }
             // 只處理可見範圍（含少量前後緩衝），這是效能關鍵
             let first = ((viewport.min.x / step).floor() as isize - 2).max(0) as usize;
             let last = (((viewport.max.x / step).ceil() as usize) + 2).min(n);
