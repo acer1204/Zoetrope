@@ -397,6 +397,12 @@ impl ViewerApp {
 
     /// 把影像換到畫面上（重置播放狀態），並結束等待中的載入
     fn show(&mut self, img: CurrentImage) {
+        // HDR 的預設曲線依來源而定（scRGB 截圖用截斷、EXR 用 ACES），
+        // 換圖時一併重置曝光，避免上一張的設定套到不同性質的來源上
+        if let Some(h) = &img.hdr {
+            self.tone_op = h.kind.default_tone_op();
+            self.exposure_ev = 0.0;
+        }
         self.current = Some(img);
         self.incoming = None;
         self.awaiting = false;
@@ -611,6 +617,10 @@ impl ViewerApp {
                         if c.hdr.is_none() {
                             if let Some(d) = self.loader.peek(&c.meta.path) {
                                 c.hdr = d.hdr.clone();
+                                if let Some(h) = &c.hdr {
+                                    self.tone_op = h.kind.default_tone_op();
+                                    self.exposure_ev = 0.0;
+                                }
                             }
                         }
                     }

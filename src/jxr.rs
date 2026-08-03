@@ -135,7 +135,13 @@ mod win {
                     .CopyPixels(std::ptr::null(), stride as u32, bytes)
                     .map_err(|e| err("複製像素", e))?;
                 let px = buf.iter().map(|v| crate::hdr::f32_to_f16(*v)).collect();
-                Ok(JxrImage::Hdr(crate::hdr::HdrImage { size: [wu, hu], px }))
+                // Windows 遊戲列與 NVIDIA 的 HDR 截圖是 scRGB：1.0 就是 SDR 白。
+                // 標為顯示參考，色調映射才會用正確的預設（截斷而非 ACES）。
+                Ok(JxrImage::Hdr(crate::hdr::HdrImage {
+                    size: [wu, hu],
+                    px,
+                    kind: crate::hdr::HdrKind::DisplayReferred,
+                }))
             } else {
                 let stride = wu * 4;
                 let mut buf = vec![0u8; wu * hu * 4];
