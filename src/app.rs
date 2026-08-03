@@ -286,6 +286,13 @@ impl ViewerApp {
     ) -> Self {
         let cache = Arc::new(Mutex::new(Cache::default()));
         let loader = Loader::new(cc.egui_ctx.clone(), cache);
+        // 把實際拿到的輸出格式記下來。egui-wgpu 只會挑 8-bit 的
+        // Rgba8Unorm/Bgra8Unorm，所以即使 Windows 開了 HDR，我們仍然是
+        // 一般的 SDR 視窗、由系統合成——問「現在是不是 HDR 輸出」時看這裡。
+        let renderer_label = match cc.wgpu_render_state.as_ref() {
+            Some(rs) => format!("{renderer_label} · {:?}", rs.target_format),
+            None => renderer_label,
+        };
         let prefs = cc
             .storage
             .and_then(|s| eframe::get_value::<Prefs>(s, "prefs"))
