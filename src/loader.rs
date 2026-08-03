@@ -563,7 +563,8 @@ fn emit_hdr(
 
     // 預設曲線依來源而定：顯示參考（scRGB 截圖）用截斷，
     // 場景參考（EXR/Radiance）才用 ACES
-    let lut = crate::hdr::ToneLut::build(0.0, hdr.kind.default_tone_op());
+    let lut =
+        crate::hdr::ToneLut::build(hdr.kind.default_exposure_ev(), hdr.kind.default_tone_op());
     let base = Arc::new(crate::hdr::tonemap(&hdr, &lut));
     let frame = FrameData::new(base.clone(), Duration::ZERO);
     send(LoadEvent::Frame {
@@ -644,7 +645,8 @@ fn decode_hdr(
 
     // 預設曲線依來源而定：顯示參考（scRGB 截圖）用截斷，
     // 場景參考（EXR/Radiance）才用 ACES
-    let lut = crate::hdr::ToneLut::build(0.0, hdr.kind.default_tone_op());
+    let lut =
+        crate::hdr::ToneLut::build(hdr.kind.default_exposure_ev(), hdr.kind.default_tone_op());
     let base = Arc::new(crate::hdr::tonemap(&hdr, &lut));
     let frame = FrameData::new(base.clone(), Duration::ZERO);
     send(LoadEvent::Frame {
@@ -1022,7 +1024,10 @@ pub fn decode_static(path: &Path) -> Result<(RgbaImage, String), String> {
         return match crate::jxr::decode(path)? {
             crate::jxr::JxrImage::Sdr(img) => Ok((img, "JPEG XR".to_owned())),
             crate::jxr::JxrImage::Hdr(h) => {
-                let lut = crate::hdr::ToneLut::build(0.0, h.kind.default_tone_op());
+                let lut = crate::hdr::ToneLut::build(
+                    h.kind.default_exposure_ev(),
+                    h.kind.default_tone_op(),
+                );
                 let ci = crate::hdr::tonemap(&h, &lut);
                 let mut out = RgbaImage::new(h.size[0] as u32, h.size[1] as u32);
                 for (px, c) in out.pixels_mut().zip(ci.pixels.iter()) {

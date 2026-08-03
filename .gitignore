@@ -13,6 +13,7 @@ Cargo.lock.orig
 /Zoetrope.exe
 /zoetrope
 *.old.exe
+*.old-*.exe
 
 # 測試樣本檔（自行放入，不納入版控；說明見 tests/assets/README.md）
 /tests/assets/*

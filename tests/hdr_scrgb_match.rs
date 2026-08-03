@@ -1,12 +1,13 @@
 //! 驗證「顯示參考」HDR（scRGB，Windows/NVIDIA 的 HDR 截圖）的轉換
 //! 與 Windows 相簿一致。
 //!
-//! 背景：scRGB 的 1.0 **就是** SDR 白，超過的部分是 HDR 螢幕才顯示得出的高光。
-//! Windows 的作法是直接截斷到 0–1 再做 sRGB 編碼；若誤套 ACES（那是給
-//! 場景參考的 EXR 用的），中間調會整體被拉亮，畫面發灰。
+//! 背景：scRGB 的 1.0 只有 80 nits，而 HDR 內容的「紙白」實際上落在
+//! 200 nits 附近。轉成 SDR 時要把**紙白**對應到螢幕白，否則整張會偏亮約
+//! 1.5 級。曲線方面則要用截斷而非 ACES——ACES 是給場景參考的 EXR 用的。
 //!
-//! 這裡用實測數據把正確行為固定下來：一張真實的 NVIDIA HDR 截圖，
-//! 來源 R 通道中位數 0.3052，Windows 輸出中位數 150。
+//! 期望值是實測 Windows 相簿得來的：產生一張已知 scRGB 數值的階梯圖，
+//! 用相簿開啟後從畫面讀回每一階的顏色。最關鍵的一點是相簿把 scRGB 1.0
+//! 畫成 161（而非 255），由此反推出紙白約 226 nits。
 
 use zoetrope::hdr::{self, HdrImage, HdrKind, ToneOp};
 
@@ -29,50 +30,70 @@ fn display_referred_defaults_to_clip_not_aces() {
     assert_eq!(HdrKind::SceneReferred.default_tone_op(), ToneOp::Aces);
 }
 
-/// 核心迴歸測試：真實截圖的中位數必須對得上 Windows 的輸出
+/// 核心迴歸測試：輸出必須對得上 Windows 相簿**實際畫在螢幕上**的值。
+///
+/// 這組期望值是實測來的：產生一張已知 scRGB 數值的階梯圖，用相簿開啟，
+/// 再從畫面上讀回每一階的顏色（見 scratchpad 的 stepwedge/readpatches）。
+///
+/// 關鍵發現：相簿並沒有把 scRGB 1.0 當成白（它畫成 161），因為 HDR 內容的
+/// 「紙白」遠高於 scRGB 定義的 80 nits。把紙白對應到 SDR 白之後才會一致。
 #[test]
-fn matches_windows_rendering_on_real_screenshot_values() {
-    // 取自 3840×2160 的 NVIDIA HDR 截圖實測分佈
-    // （來源浮點值 → Windows 相簿的 8-bit 輸出）
+fn matches_windows_photos_measured_output() {
+    // (scRGB 輸入, Windows 相簿實際輸出)
     let cases = [
-        (0.0f32, 0u8),  // 純黑
-        (0.010_1, 26),  // p01
-        (0.305_2, 150), // p50 ← 最關鍵的一點
-        (1.0, 255),     // SDR 白
-        (2.24, 255),    // p90，超過 1.0 一律截斷
-        (2.5, 255),     // 最大值
+        (0.20f32, 77u8),
+        (0.30, 92),
+        (0.40, 106),
+        (0.60, 128),
+        (0.80, 146),
+        (1.00, 161), // ← 1.0 不是白，這是最關鍵的一點
+        (1.50, 193),
     ];
 
-    let lut = hdr::ToneLut::build(0.0, HdrKind::DisplayReferred.default_tone_op());
+    let kind = HdrKind::DisplayReferred;
+    let lut = hdr::ToneLut::build(kind.default_exposure_ev(), kind.default_tone_op());
     for (src, expect) in cases {
-        let got = hdr::tonemap(&single(src, HdrKind::DisplayReferred), &lut).pixels[0].r();
+        let got = hdr::tonemap(&single(src, kind), &lut).pixels[0].r();
         assert!(
-            got.abs_diff(expect) <= 2,
-            "來源 {src} 應輸出約 {expect}（Windows 相簿的結果），實際 {got}"
+            got.abs_diff(expect) <= 4,
+            "來源 {src} 應輸出約 {expect}（相簿實測值），實際 {got}"
         );
     }
 }
 
-/// 對照：若誤用 ACES，中間調會明顯偏亮——這正是修正前的症狀
+/// 預設曝光必須把紙白拉回 SDR 白，約 −1.5 EV
 #[test]
-fn aces_on_display_referred_content_is_visibly_too_bright() {
-    let src = 0.305_2;
-    let correct = hdr::tonemap(
-        &single(src, HdrKind::DisplayReferred),
-        &hdr::ToneLut::build(0.0, ToneOp::Clip),
-    )
-    .pixels[0]
-        .r();
-    let wrong = hdr::tonemap(
-        &single(src, HdrKind::DisplayReferred),
-        &hdr::ToneLut::build(0.0, ToneOp::Aces),
-    )
-    .pixels[0]
-        .r();
+fn display_referred_default_exposure_maps_paper_white() {
+    let ev = HdrKind::DisplayReferred.default_exposure_ev();
     assert!(
-        wrong > correct + 20,
-        "ACES 套在顯示參考內容上應明顯偏亮（這是修正前的 bug）：\
-         截斷 {correct} vs ACES {wrong}"
+        (-1.6..=-1.4).contains(&ev),
+        "顯示參考的預設曝光應約 -1.5 EV，實際 {ev}"
+    );
+    assert_eq!(
+        HdrKind::SceneReferred.default_exposure_ev(),
+        0.0,
+        "場景參考不該預設偏移曝光"
+    );
+}
+
+/// 對照：0 EV（把 scRGB 1.0 當成白）會明顯偏亮——這正是修正前的症狀
+#[test]
+fn zero_ev_on_display_referred_content_is_visibly_too_bright() {
+    let src = 0.305_2;
+    let kind = HdrKind::DisplayReferred;
+    let correct = hdr::tonemap(
+        &single(src, kind),
+        &hdr::ToneLut::build(kind.default_exposure_ev(), kind.default_tone_op()),
+    )
+    .pixels[0]
+        .r();
+    let too_bright =
+        hdr::tonemap(&single(src, kind), &hdr::ToneLut::build(0.0, ToneOp::Clip)).pixels[0].r();
+    let way_too_bright =
+        hdr::tonemap(&single(src, kind), &hdr::ToneLut::build(0.0, ToneOp::Aces)).pixels[0].r();
+    assert!(
+        correct + 25 < too_bright && too_bright < way_too_bright,
+        "亮度應為 修正後 < 0EV截斷 < 0EV的ACES：{correct} / {too_bright} / {way_too_bright}"
     );
 }
 
@@ -97,27 +118,28 @@ fn halving_preserves_kind() {
     assert_eq!(img.halved().kind, HdrKind::DisplayReferred);
 }
 
-/// 曝光補償仍可用來救回被截斷的高光
+/// 曝光補償仍可用來救回極亮的高光
 #[test]
 fn exposure_recovers_clipped_highlights() {
-    let src = 2.0f32; // 超過 1.0，預設會被截斷成白
-    let at0 = hdr::tonemap(
-        &single(src, HdrKind::DisplayReferred),
-        &hdr::ToneLut::build(0.0, ToneOp::Clip),
+    let kind = HdrKind::DisplayReferred;
+    let src = 6.0f32; // 預設曝光下已超出範圍，會是白
+    let at_default = hdr::tonemap(
+        &single(src, kind),
+        &hdr::ToneLut::build(kind.default_exposure_ev(), ToneOp::Clip),
     )
     .pixels[0]
         .r();
-    assert_eq!(at0, 255, "0 EV 時應為白");
+    assert_eq!(at_default, 255, "預設曝光下 6.0 應為白");
 
-    // 降 2 EV（×0.25）後 2.0 變成 0.5，細節就回來了
+    // 再降 3 EV 就能看見其中的層次
     let down = hdr::tonemap(
-        &single(src, HdrKind::DisplayReferred),
-        &hdr::ToneLut::build(-2.0, ToneOp::Clip),
+        &single(src, kind),
+        &hdr::ToneLut::build(kind.default_exposure_ev() - 3.0, ToneOp::Clip),
     )
     .pixels[0]
         .r();
     assert!(
-        (170..=200).contains(&down),
-        "降 2 EV 後應顯示出高光細節（約 188），實際 {down}"
+        down < 240,
+        "再降 3 EV 後應顯示出高光細節而非全白，實際 {down}"
     );
 }

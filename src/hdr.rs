@@ -33,11 +33,36 @@ pub enum HdrKind {
     SceneReferred,
 }
 
+/// HDR 內容的「紙白」亮度（nits）。
+///
+/// scRGB 的 1.0 定義為 80 nits，但 HDR 內容實際把白色畫在更高的亮度上——
+/// 遊戲與影片一般落在 200 nits 附近（BT.2408 建議 203）。轉成 SDR 時要把
+/// **紙白**對應到螢幕白，而不是把 80 nits 當成白，否則整張會亮約 1.5 級。
+///
+/// 這個數值是量測 Windows 相簿的實際輸出反推得到的（見 tests/hdr_scrgb_match.rs）：
+/// 相簿把 scRGB 1.0 畫成 161，等效倍率 ×0.354 → 80 / 0.354 ≈ 226 nits。
+const HDR_PAPER_WHITE_NITS: f32 = 226.0;
+/// scRGB 1.0 的定義亮度
+const SCRGB_WHITE_NITS: f32 = 80.0;
+
 impl HdrKind {
     pub fn default_tone_op(self) -> ToneOp {
         match self {
             HdrKind::DisplayReferred => ToneOp::Clip,
             HdrKind::SceneReferred => ToneOp::Aces,
+        }
+    }
+
+    /// 預設曝光補償（EV）。
+    ///
+    /// 顯示參考的內容需要把紙白拉回 SDR 白（約 −1.5 EV）；
+    /// 場景參考的內容沒有固定的白點基準，交給色調映射處理即可。
+    pub fn default_exposure_ev(self) -> f32 {
+        match self {
+            HdrKind::DisplayReferred => {
+                (SCRGB_WHITE_NITS / HDR_PAPER_WHITE_NITS).log2() // ≈ -1.5
+            }
+            HdrKind::SceneReferred => 0.0,
         }
     }
 }
