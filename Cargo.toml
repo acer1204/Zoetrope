@@ -45,6 +45,10 @@ winresource = "0.1"
 [dev-dependencies]
 ravif = "0.11"
 rgb = "0.8"
+# examples/surface_formats.rs 用：要問驅動 surface 支援哪些格式就得先有視窗。
+# 版本跟著 eframe 0.29 走，避免同時編兩份 winit。
+winit = "0.30"
+pollster = "0.4"
 
 [profile.release]
 opt-level = 3

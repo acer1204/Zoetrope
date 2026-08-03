@@ -5789,12 +5789,14 @@ dependencies = [
  "imagepipe",
  "jpeg-decoder",
  "jxl-oxide",
+ "pollster 0.4.0",
  "ravif 0.11.20",
  "rawloader",
  "rfd",
  "rgb",
  "serde",
  "windows 0.58.0",
+ "winit",
  "winresource",
 ]
 
