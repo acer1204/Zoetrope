@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use eframe::egui::ColorImage;
 
-/// 單一 GPU 貼圖的最大邊長（超過就先縮小，避免超出 wgpu/GL 貼圖上限）
+/// GPU 貼圖邊長的保守預設值。實際上限在執行時由
+/// `ctx.input(|i| i.max_texture_side)` 取得（見 Loader::set_max_tex_side），
+/// 這個常數只在還沒問到之前當作起始值。
 pub const MAX_TEX_DIM: u32 = 8192;
 /// 單一動畫解碼後的記憶體保護上限（超過就停止解碼後續影格）
 pub const ANIM_BUDGET_BYTES: usize = 3 * 1024 * 1024 * 1024;
@@ -26,9 +28,25 @@ pub struct FileEntry {
 pub struct FrameData {
     pub image: Arc<ColorImage>,
     pub delay: Duration,
+    /// 相對「前一格」的變動矩形 `[x, y, w, h]`，供部分貼圖更新使用。
+    ///
+    /// - `None`：未知，必須整張重傳
+    /// - `Some([_, _, 0, 0])`：與前一格完全相同，不必上傳
+    ///
+    /// 動畫（尤其 GIF）通常每格只有一小塊在變，只傳那一塊可省下大量頻寬。
+    pub dirty: Option<[usize; 4]>,
 }
 
 impl FrameData {
+    /// 一般建構：預設為「整張重傳」
+    pub fn new(image: Arc<ColorImage>, delay: Duration) -> Self {
+        Self {
+            image,
+            delay,
+            dirty: None,
+        }
+    }
+
     pub fn bytes(&self) -> usize {
         self.image.pixels.len() * 4
     }
@@ -48,6 +66,9 @@ pub struct ImageMeta {
 /// 解碼完成後放進快取的完整結果
 pub struct Decoded {
     pub meta: ImageMeta,
+    /// HDR/EXR 的浮點原始資料。保留它才能在調整曝光時
+    /// 重新色調映射而不必重新解碼（動畫與一般 8-bit 影像為 None）。
+    pub hdr: Option<Arc<crate::hdr::HdrImage>>,
     pub frames: Vec<FrameData>,
     /// 靜態圖的 mip 鏈：[0] 為基底貼圖，之後每層長寬減半（動畫為空）
     pub mips: Vec<Arc<ColorImage>>,
@@ -64,6 +85,15 @@ impl Decoded {
         // mips[0] 與 frames[0].image 是同一份 Arc，不重複計算
         let m: usize = mips.iter().skip(1).map(|m| m.pixels.len() * 4).sum();
         f + m
+    }
+
+    /// 含 HDR 浮點資料的總記憶體量（LRU 預算要算進去，否則會嚴重低估）
+    pub fn compute_bytes_with_hdr(
+        frames: &[FrameData],
+        mips: &[Arc<ColorImage>],
+        hdr: Option<&crate::hdr::HdrImage>,
+    ) -> usize {
+        Self::compute_bytes(frames, mips) + hdr.map_or(0, |h| h.bytes())
     }
 }
 
@@ -104,6 +134,11 @@ pub enum LoadEvent {
         generation: u64,
         entries: Vec<FileEntry>,
     },
+    /// 膠捲條縮圖完成
+    Thumb {
+        path: PathBuf,
+        image: Arc<ColorImage>,
+    },
 }
 
 /// UI → 背景工作的工作項目
@@ -114,4 +149,6 @@ pub enum Job {
     Prefetch { path: PathBuf },
     /// 掃描資料夾建立瀏覽清單
     ScanDir { dir: PathBuf, generation: u64 },
+    /// 膠捲條縮圖（最低優先權，不得排擠鄰居預載）
+    Thumb { path: PathBuf },
 }

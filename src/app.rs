@@ -143,10 +143,54 @@ struct TexCache {
     anim: Option<egui::TextureHandle>,
     anim_frame: usize,
     anim_nearest: bool,
+    /// 貼圖上目前實際是哪一份影像。漸進式解碼可能就地替換 frames[k]，
+    /// 只靠索引記帳會與 GPU 內容脫節，必須用 Arc 身分比對。
+    anim_src: Option<Arc<eframe::egui::ColorImage>>,
+}
+
+/// 一次最多跨幾格還願意用部分更新；跨太多格時聯集會接近整張，不如整張重傳
+const MAX_PARTIAL_STEPS: usize = 4;
+/// 變動面積超過整張的這個比例就整張重傳（裁切也有成本）
+const PARTIAL_AREA_LIMIT: f32 = 0.6;
+
+/// 從影像裁出子矩形（ColorImage 的欄位是公開的，逐列 memcpy 即可）
+fn crop(src: &eframe::egui::ColorImage, r: [usize; 4]) -> eframe::egui::ColorImage {
+    let [sw, sh] = src.size;
+    let x = r[0].min(sw);
+    let y = r[1].min(sh);
+    let w = r[2].min(sw - x);
+    let h = r[3].min(sh - y);
+    let mut pixels = Vec::with_capacity(w * h);
+    for row in 0..h {
+        let s = (y + row) * sw + x;
+        pixels.extend_from_slice(&src.pixels[s..s + w]);
+    }
+    eframe::egui::ColorImage {
+        size: [w, h],
+        pixels,
+    }
+}
+
+/// 取兩個矩形的聯集；`None` 代表「未知，需整張重傳」，會蓋過一切
+fn union_rect(a: Option<[usize; 4]>, b: Option<[usize; 4]>) -> Option<[usize; 4]> {
+    let (a, b) = (a?, b?);
+    if a[2] == 0 || a[3] == 0 {
+        return Some(b);
+    }
+    if b[2] == 0 || b[3] == 0 {
+        return Some(a);
+    }
+    let x0 = a[0].min(b[0]);
+    let y0 = a[1].min(b[1]);
+    let x1 = (a[0] + a[2]).max(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).max(b[1] + b[3]);
+    Some([x0, y0, x1 - x0, y1 - y0])
 }
 
 struct CurrentImage {
     meta: ImageMeta,
+    /// HDR/EXR 的浮點原始資料，調整曝光時重新色調映射用
+    hdr: Option<Arc<crate::hdr::HdrImage>>,
     frames: Vec<FrameData>,
     mips: Vec<Arc<eframe::egui::ColorImage>>,
     complete: bool,
@@ -158,6 +202,7 @@ impl CurrentImage {
     fn empty(meta: ImageMeta) -> Self {
         Self {
             meta,
+            hdr: None,
             frames: Vec::new(),
             mips: Vec::new(),
             complete: false,
@@ -168,6 +213,7 @@ impl CurrentImage {
     fn from_decoded(d: &Decoded) -> Self {
         Self {
             meta: d.meta.clone(),
+            hdr: d.hdr.clone(),
             frames: d.frames.clone(),
             mips: d.mips.clone(),
             complete: d.complete,
@@ -214,8 +260,21 @@ pub struct ViewerApp {
     wheel_accum: f32,
     last_wheel: Option<Instant>,
 
+    /// HDR 曝光補償（EV，實際乘數為 2^ev）
+    exposure_ev: f32,
+    tone_op: crate::hdr::ToneOp,
+
     fullscreen: bool,
     show_info: bool,
+    show_about: bool,
+
+    /// 膠捲條：縮圖快取、已建立的貼圖、是否釘選顯示
+    thumbs: crate::thumbs::ThumbCache,
+    thumb_tex: std::collections::HashMap<PathBuf, egui::TextureHandle>,
+    strip_pinned: bool,
+    /// 需要把目前索引捲進可見範圍（翻頁後觸發）
+    strip_scroll_to_current: bool,
+
     prefs: Prefs,
 }
 
@@ -255,8 +314,15 @@ impl ViewerApp {
             next_frame_at: None,
             wheel_accum: 0.0,
             last_wheel: None,
+            exposure_ev: 0.0,
+            tone_op: crate::hdr::ToneOp::Aces,
             fullscreen: false,
             show_info: false,
+            show_about: false,
+            thumbs: crate::thumbs::ThumbCache::default(),
+            thumb_tex: std::collections::HashMap::new(),
+            strip_pinned: false,
+            strip_scroll_to_current: false,
             prefs,
         };
         if let Some(p) = initial {
@@ -340,6 +406,18 @@ impl ViewerApp {
         self.playing = true;
     }
 
+    /// 以目前的曝光與運算子重新色調映射 HDR 影像。
+    /// 只重建查表（約 1ms）與重跑映射（4K 約 15ms），不重新解碼。
+    fn retonemap(&mut self) {
+        let Some(cur) = &mut self.current else { return };
+        let Some(hdr) = cur.hdr.clone() else { return };
+        let lut = crate::hdr::ToneLut::build(self.exposure_ev, self.tone_op);
+        let base = Arc::new(crate::hdr::tonemap(&hdr, &lut));
+        cur.frames = vec![FrameData::new(base.clone(), Duration::ZERO)];
+        cur.mips = crate::loader::build_mips(base);
+        cur.tex.static_mips.clear(); // 讓貼圖重新上傳
+    }
+
     /// 載入中的新圖已有可畫的影格 → 取代畫面上的舊圖
     fn promote_if_ready(&mut self, ctx: &Context) {
         let ready = self.incoming.as_ref().is_some_and(|c| !c.frames.is_empty());
@@ -358,6 +436,7 @@ impl ViewerApp {
         let new = (self.index as isize + delta).clamp(0, last) as usize;
         if new != self.index {
             self.index = new;
+            self.strip_scroll_to_current = true;
             let p = self.entries[new].path.clone();
             self.open_path(ctx, p);
         }
@@ -366,6 +445,7 @@ impl ViewerApp {
     fn nav_to(&mut self, ctx: &Context, idx: usize) {
         if idx < self.entries.len() && idx != self.index {
             self.index = idx;
+            self.strip_scroll_to_current = true;
             let p = self.entries[idx].path.clone();
             self.open_path(ctx, p);
         }
@@ -525,6 +605,15 @@ impl ViewerApp {
                     }
                     // 解碼結束仍在等待 → 換上（防禦：正常情況第一格早已觸發）
                     self.promote_if_ready(ctx);
+                    // HDR 的浮點原始資料不走事件協定，解碼完成後從快取取回，
+                    // 之後調整曝光才不必重新解碼
+                    if let Some(c) = &mut self.current {
+                        if c.hdr.is_none() {
+                            if let Some(d) = self.loader.peek(&c.meta.path) {
+                                c.hdr = d.hdr.clone();
+                            }
+                        }
+                    }
                     if self.awaiting {
                         // 沒有任何影格可顯示，結束等待狀態
                         self.awaiting = false;
@@ -548,6 +637,9 @@ impl ViewerApp {
                         self.current = None;
                         self.update_title(ctx);
                     }
+                }
+                LoadEvent::Thumb { path, image } => {
+                    self.thumbs.insert(path, image);
                 }
                 LoadEvent::Prefetched { path } => {
                     // 使用者正好翻到還沒解完的這張：直接採用快取的預載結果。
@@ -690,6 +782,7 @@ impl ViewerApp {
             open: bool,
             reload: bool,
             sort_flip: bool,
+            strip: bool,
             step_fwd: bool,
             step_back: bool,
             mouse_back: bool,
@@ -719,6 +812,7 @@ impl ViewerApp {
             open: i.key_pressed(Key::O),
             reload: i.key_pressed(Key::F5),
             sort_flip: i.key_pressed(Key::S),
+            strip: i.key_pressed(Key::T),
             step_fwd: i.key_pressed(Key::Period),
             step_back: i.key_pressed(Key::Comma),
             mouse_back: i.pointer.button_pressed(PointerButton::Extra1),
@@ -741,6 +835,12 @@ impl ViewerApp {
         if k.sort_flip {
             self.prefs.sort_asc = !self.prefs.sort_asc;
             self.apply_sort();
+        }
+        if k.strip {
+            self.strip_pinned = !self.strip_pinned;
+            if self.strip_pinned {
+                self.strip_scroll_to_current = true;
+            }
         }
         if k.space {
             let animated = self.current.as_ref().is_some_and(|c| c.frames.len() > 1);
@@ -1116,21 +1216,74 @@ impl ViewerApp {
         if cur.frames.len() > 1 {
             let fi = frame_idx.min(cur.frames.len() - 1);
             let img = cur.frames[fi].image.clone();
-            match &mut cur.tex.anim {
-                None => {
-                    let tex = ctx.load_texture("anim", egui::ImageData::Color(img), opts(nearest));
-                    cur.tex.anim_frame = fi;
-                    cur.tex.anim_nearest = nearest;
-                    cur.tex.anim = Some(tex);
-                }
-                Some(tex) => {
-                    if cur.tex.anim_frame != fi || cur.tex.anim_nearest != nearest {
-                        tex.set(egui::ImageData::Color(img), opts(nearest));
-                        cur.tex.anim_frame = fi;
-                        cur.tex.anim_nearest = nearest;
+
+            // 首次配置：整張上傳
+            let Some(tex) = cur.tex.anim.as_mut() else {
+                let tex =
+                    ctx.load_texture("anim", egui::ImageData::Color(img.clone()), opts(nearest));
+                cur.tex.anim_frame = fi;
+                cur.tex.anim_nearest = nearest;
+                cur.tex.anim_src = Some(img);
+                cur.tex.anim = Some(tex);
+                return cur.tex.anim.as_ref().map(|t| t.id());
+            };
+
+            let prev_fi = cur.tex.anim_frame;
+            let same_filter = cur.tex.anim_nearest == nearest;
+            if prev_fi == fi && same_filter {
+                return Some(tex.id()); // 同一格，什麼都不用做
+            }
+
+            // 只在「單向前進、步數不多、貼圖內容確實是我們記的那一格」時
+            // 才做部分更新——這是正確性前提，不是最佳化選項。
+            // 倒退播放、跨大步（休眠後追格）、切換取樣模式一律整張重傳。
+            let src_ok = cur.tex.anim_src.as_ref().is_some_and(|s| {
+                cur.frames
+                    .get(prev_fi)
+                    .is_some_and(|f| Arc::ptr_eq(s, &f.image))
+            });
+            let forward_small = fi > prev_fi && fi - prev_fi <= MAX_PARTIAL_STEPS;
+            let size_ok = cur
+                .frames
+                .get(prev_fi)
+                .is_some_and(|f| f.image.size == img.size);
+
+            let mut rect = None;
+            if same_filter && src_ok && forward_small && size_ok {
+                // 聯集 prev_fi+1..=fi 各格的變動矩形
+                let mut acc = Some([0usize; 4]);
+                for k in (prev_fi + 1)..=fi {
+                    acc = union_rect(acc, cur.frames[k].dirty);
+                    if acc.is_none() {
+                        break;
                     }
                 }
+                let [w, h] = img.size;
+                rect = acc.filter(|r| {
+                    // 自行做邊界檢查：epaint 的檢查是 debug_assert，release 不會擋，
+                    // 越界的部分更新會直接觸發 wgpu 驗證錯誤
+                    let in_bounds = r[0] + r[2] <= w && r[1] + r[3] <= h;
+                    let area = (r[2] * r[3]) as f32;
+                    let full = (w * h).max(1) as f32;
+                    in_bounds && area <= full * PARTIAL_AREA_LIMIT
+                });
             }
+
+            match rect {
+                // 完全沒變動：連上傳都不用
+                Some([_, _, 0, 0]) => {}
+                Some(r) => {
+                    tex.set_partial(
+                        [r[0], r[1]],
+                        egui::ImageData::Color(Arc::new(crop(&img, r))),
+                        opts(nearest),
+                    );
+                }
+                None => tex.set(egui::ImageData::Color(img.clone()), opts(nearest)),
+            }
+            cur.tex.anim_frame = fi;
+            cur.tex.anim_nearest = nearest;
+            cur.tex.anim_src = Some(img);
             return cur.tex.anim.as_ref().map(|t| t.id());
         }
 
@@ -1371,6 +1524,45 @@ impl ViewerApp {
                     act_rot_cw = true;
                 }
 
+                // HDR 影像才顯示這顆按鈕；選單內含曝光與色調映射運算子
+                if self.current.as_ref().is_some_and(|c| c.hdr.is_some()) {
+                    ui.separator();
+                    let mut changed = false;
+                    ui.menu_button("HDR", |ui| {
+                        ui.label("曝光補償");
+                        let sl = egui::Slider::new(&mut self.exposure_ev, -6.0..=6.0)
+                            .suffix(" EV")
+                            .step_by(0.1);
+                        if ui.add(sl).changed() {
+                            changed = true;
+                        }
+                        if ui.button("重設為 0 EV").clicked() {
+                            self.exposure_ev = 0.0;
+                            changed = true;
+                        }
+                        ui.separator();
+                        ui.label("色調映射");
+                        for op in [
+                            crate::hdr::ToneOp::Aces,
+                            crate::hdr::ToneOp::Reinhard,
+                            crate::hdr::ToneOp::Clip,
+                        ] {
+                            if ui.radio_value(&mut self.tone_op, op, op.name()).changed() {
+                                changed = true;
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(format!(
+                        "HDR 顯示設定：{:+.1} EV · {}",
+                        self.exposure_ev,
+                        self.tone_op.name()
+                    ));
+                    if changed {
+                        self.retonemap();
+                    }
+                }
+
                 let animated = self.current.as_ref().is_some_and(|c| c.frames.len() > 1);
                 if animated {
                     ui.separator();
@@ -1397,6 +1589,23 @@ impl ViewerApp {
                         .clicked()
                     {
                         self.show_info = !self.show_info;
+                    }
+                    if ui
+                        .selectable_label(self.show_about, "？")
+                        .on_hover_text("關於 Zoetrope")
+                        .clicked()
+                    {
+                        self.show_about = !self.show_about;
+                    }
+                    if ui
+                        .selectable_label(self.strip_pinned, "▤")
+                        .on_hover_text("膠捲條 (T)：釘選顯示；未釘選時滑鼠移到底部也會浮出")
+                        .clicked()
+                    {
+                        self.strip_pinned = !self.strip_pinned;
+                        if self.strip_pinned {
+                            self.strip_scroll_to_current = true;
+                        }
                     }
                 });
 
@@ -1473,6 +1682,243 @@ impl ViewerApp {
         });
     }
 
+    /// 底部膠捲條。
+    ///
+    /// 刻意用 `Area` 而非 `TopBottomPanel::show_animated`——後者在淡入淡出
+    /// 的中間狀態會畫一個空面板（內容整個消失），而且會擠壓 CentralPanel
+    /// 導致圖片跟著跳動。
+    fn filmstrip(&mut self, ctx: &Context) {
+        const STRIP_H: f32 = 92.0;
+        const CELL_W: f32 = 108.0;
+        const HOVER_ZONE: f32 = 70.0;
+
+        if self.entries.len() < 2 {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        // 滑鼠靠近底部或已釘選就展開
+        let near_bottom = ctx
+            .input(|i| i.pointer.hover_pos())
+            .is_some_and(|p| p.y > screen.bottom() - HOVER_ZONE);
+        let want = self.strip_pinned || near_bottom;
+        let t = ctx.animate_bool_with_time(egui::Id::new("filmstrip"), want, 0.18);
+        if t <= 0.001 {
+            return;
+        }
+
+        let strip_rect = Rect::from_min_size(
+            egui::pos2(screen.left(), screen.bottom() - STRIP_H),
+            egui::vec2(screen.width(), STRIP_H),
+        );
+        let mut clicked: Option<usize> = None;
+
+        egui::Area::new(egui::Id::new("filmstrip-area"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(strip_rect.min)
+            .show(ctx, |ui| {
+                ui.set_opacity(t);
+                ui.set_min_size(strip_rect.size());
+                ui.set_max_size(strip_rect.size());
+                egui::Frame::none()
+                    .fill(Color32::from_rgba_unmultiplied(16, 16, 18, 235))
+                    .inner_margin(egui::Margin::symmetric(6.0, 5.0))
+                    .show(ui, |ui| {
+                        // 垂直滾輪要能捲動這個只啟用水平方向的區域
+                        ui.style_mut().always_scroll_the_only_direction = true;
+                        ui.set_height(STRIP_H - 10.0);
+                        clicked = self.strip_contents(ui, CELL_W, STRIP_H - 10.0);
+                    });
+            });
+
+        if let Some(i) = clicked {
+            self.nav_to(ctx, i);
+        }
+    }
+
+    /// 膠捲條內容：只為可見範圍的格子請求縮圖與建立貼圖
+    fn strip_contents(&mut self, ui: &mut egui::Ui, cell_w: f32, cell_h: f32) -> Option<usize> {
+        let n = self.entries.len();
+        let spacing = ui.spacing().item_spacing.x;
+        let step = cell_w + spacing;
+        let total_w = step * n as f32;
+        let mut clicked = None;
+        let cur = self.index;
+        let scroll_to = std::mem::take(&mut self.strip_scroll_to_current);
+
+        let mut area = egui::ScrollArea::horizontal()
+            .auto_shrink([false, false])
+            .id_salt("filmstrip-scroll");
+        if scroll_to {
+            // 讓目前這格置中
+            let target = step * cur as f32 + cell_w * 0.5 - ui.available_width() * 0.5;
+            area = area.horizontal_scroll_offset(target.max(0.0));
+        }
+
+        area.show_viewport(ui, |ui, viewport| {
+            ui.set_width(total_w);
+            ui.set_height(cell_h);
+            // 只處理可見範圍（含少量前後緩衝），這是效能關鍵
+            let first = ((viewport.min.x / step).floor() as isize - 2).max(0) as usize;
+            let last = (((viewport.max.x / step).ceil() as usize) + 2).min(n);
+
+            for i in first..last {
+                let x = step * i as f32;
+                let rect = Rect::from_min_size(
+                    ui.min_rect().min + Vec2::new(x, 0.0),
+                    egui::vec2(cell_w, cell_h),
+                );
+                let resp = ui.allocate_rect(rect, Sense::click());
+                if resp.clicked() {
+                    clicked = Some(i);
+                }
+                self.draw_thumb_cell(ui, rect, i, i == cur, resp.hovered());
+            }
+        });
+        clicked
+    }
+
+    fn draw_thumb_cell(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        index: usize,
+        is_current: bool,
+        hovered: bool,
+    ) {
+        let path = self.entries[index].path.clone();
+        let painter = ui.painter();
+
+        // 目前這格用醒目外框，滑過時淡淡highlight
+        if is_current {
+            painter.rect_filled(rect, 3.0, Color32::from_rgba_unmultiplied(90, 130, 200, 90));
+        } else if hovered {
+            painter.rect_filled(
+                rect,
+                3.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+            );
+        }
+
+        // 取得（或請求）縮圖
+        let tex = match self.thumb_tex.get(&path) {
+            Some(t) => Some(t.clone()),
+            None => match self.thumbs.get(&path) {
+                Some(img) => {
+                    let t = ui.ctx().load_texture(
+                        format!("thumb{index}"),
+                        egui::ImageData::Color(img),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.thumb_tex.insert(path.clone(), t.clone());
+                    Some(t)
+                }
+                None => {
+                    self.loader.request_thumb(path.clone());
+                    None
+                }
+            },
+        };
+
+        let painter = ui.painter();
+        let inner = rect.shrink(4.0);
+        match tex {
+            Some(t) => {
+                let sz = t.size_vec2();
+                let scale = (inner.width() / sz.x).min(inner.height() / sz.y);
+                let draw = Rect::from_center_size(inner.center(), sz * scale);
+                painter.image(
+                    t.id(),
+                    draw,
+                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                if is_current {
+                    painter.rect_stroke(
+                        draw.expand(1.5),
+                        2.0,
+                        egui::Stroke::new(2.0_f32, Color32::from_rgb(120, 170, 255)),
+                    );
+                }
+            }
+            None => {
+                // 佔位：淡淡的方框，避免捲動時畫面空洞
+                painter.rect_filled(
+                    inner,
+                    3.0,
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                );
+            }
+        }
+    }
+
+    fn about_window(&mut self, ctx: &Context) {
+        if !self.show_about {
+            return;
+        }
+        const REPO: &str = "https://github.com/acer1204/Zoetrope";
+        let mut open = self.show_about;
+        egui::Window::new("關於")
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Zoetrope 走馬燈").size(22.0).strong());
+                    ui.label(
+                        egui::RichText::new(format!("版本 {}", env!("CARGO_PKG_VERSION")))
+                            .size(13.0)
+                            .weak(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label("極速跨平台看圖軟體");
+                    ui.label(
+                        egui::RichText::new("以 Rust + egui + wgpu 打造")
+                            .size(12.0)
+                            .weak(),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                egui::Grid::new("about-grid")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("專案首頁");
+                        ui.hyperlink_to("github.com/acer1204/Zoetrope", REPO);
+                        ui.end_row();
+                        ui.label("回報問題");
+                        ui.hyperlink_to("Issues", format!("{REPO}/issues"));
+                        ui.end_row();
+                        ui.label("最新版本");
+                        ui.hyperlink_to("Releases", format!("{REPO}/releases"));
+                        ui.end_row();
+                        ui.label("授權");
+                        ui.hyperlink_to("AGPL-3.0", format!("{REPO}/blob/main/LICENSE"));
+                        ui.end_row();
+                        ui.label("繪圖後端");
+                        ui.label(&self.renderer_label);
+                        ui.end_row();
+                        ui.label("貼圖上限");
+                        ui.label(format!("{0} × {0} px", crate::loader::max_tex_side()));
+                        ui.end_row();
+                    });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
+                        "本程式使用 jxl-oxide（JPEG XL）、heic（HEIC/AVIF）、\n\
+                         rawloader 與 imagepipe（相機 RAW）等開源元件，\n\
+                         各自的授權條款詳見專案 README。",
+                    )
+                    .size(11.0)
+                    .weak(),
+                );
+            });
+        self.show_about = open;
+    }
+
     fn info_window(&mut self, ctx: &Context) {
         if !self.show_info {
             return;
@@ -1522,6 +1968,9 @@ impl ViewerApp {
                         ui.label("繪圖後端");
                         ui.label(&self.renderer_label);
                         ui.end_row();
+                        ui.label("貼圖上限");
+                        ui.label(format!("{0} × {0} px", crate::loader::max_tex_side()));
+                        ui.end_row();
                     });
                 } else {
                     ui.label("尚未開啟圖片");
@@ -1548,6 +1997,12 @@ impl eframe::App for ViewerApp {
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // 把實際的 GPU 貼圖上限告訴解碼執行緒（egui 在第一幀後才知道真值）
+        let side = ctx.input(|i| i.max_texture_side) as u32;
+        if cfg!(debug_assertions) && side != crate::loader::max_tex_side() {
+            eprintln!("[zoetrope] max_texture_side = {side}");
+        }
+        crate::loader::set_max_tex_side(side);
         self.process_events(ctx);
         self.handle_input(ctx);
         self.advance_animation(ctx);
@@ -1561,7 +2016,9 @@ impl eframe::App for ViewerApp {
             .show(ctx, |ui| {
                 self.canvas(ui);
             });
+        self.filmstrip(ctx);
         self.info_window(ctx);
+        self.about_window(ctx);
     }
 }
 

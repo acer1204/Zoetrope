@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,17 +26,24 @@ use crate::types::*;
 pub struct Loader {
     hi_tx: Sender<Job>,
     lo_tx: Sender<Job>,
+    /// 最低優先權：膠捲條縮圖。獨立一條佇列，
+    /// 快速捲動膠捲條時才不會把鄰居預載餓死。
+    th_tx: Sender<Job>,
     pub events: Receiver<LoadEvent>,
     pub latest_gen: Arc<AtomicU64>,
     cache: Arc<Mutex<Cache>>,
+    /// 已排入佇列的縮圖路徑，避免重複請求
+    thumb_pending: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
 }
 
 impl Loader {
     pub fn new(ctx: Context, cache: Arc<Mutex<Cache>>) -> Self {
         let (hi_tx, hi_rx) = unbounded::<Job>();
         let (lo_tx, lo_rx) = unbounded::<Job>();
+        let (th_tx, th_rx) = unbounded::<Job>();
         let (ev_tx, ev_rx) = unbounded::<LoadEvent>();
         let latest_gen = Arc::new(AtomicU64::new(0));
+        let thumb_pending = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -47,22 +54,36 @@ impl Loader {
         for wi in 0..workers {
             let hi_rx = hi_rx.clone();
             let lo_rx = lo_rx.clone();
+            let th_rx = th_rx.clone();
             let ev_tx = ev_tx.clone();
             let ctx = ctx.clone();
             let latest_gen = latest_gen.clone();
             let cache = cache.clone();
+            let pending = thumb_pending.clone();
             std::thread::Builder::new()
                 .name(format!("decode-{wi}"))
-                .spawn(move || worker_loop(hi_rx, lo_rx, ev_tx, ctx, latest_gen, cache))
+                .spawn(move || {
+                    worker_loop(hi_rx, lo_rx, th_rx, ev_tx, ctx, latest_gen, cache, pending)
+                })
                 .expect("spawn decode worker");
         }
 
         Self {
             hi_tx,
             lo_tx,
+            th_tx,
             events: ev_rx,
             latest_gen,
             cache,
+            thumb_pending,
+        }
+    }
+
+    /// 請求一張膠捲條縮圖（最低優先權，重複請求會被忽略）
+    pub fn request_thumb(&self, path: PathBuf) {
+        let mut pending = self.thumb_pending.lock().unwrap();
+        if pending.insert(path.clone()) {
+            let _ = self.th_tx.send(Job::Thumb { path });
         }
     }
 
@@ -107,21 +128,26 @@ impl Loader {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     hi_rx: Receiver<Job>,
     lo_rx: Receiver<Job>,
+    th_rx: Receiver<Job>,
     ev_tx: Sender<LoadEvent>,
     ctx: Context,
     latest_gen: Arc<AtomicU64>,
     cache: Arc<Mutex<Cache>>,
+    thumb_pending: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
 ) {
     loop {
-        // 先清空高優先權佇列，兩邊都空才阻塞等待
-        let job = match hi_rx.try_recv() {
+        // 嚴格優先權：目前圖片 > 鄰居預載 > 膠捲條縮圖。
+        // 三條都空才阻塞等待，確保捲膠捲條不會拖慢翻頁。
+        let job = match hi_rx.try_recv().or_else(|_| lo_rx.try_recv()) {
             Ok(j) => j,
             Err(_) => crossbeam_channel::select! {
                 recv(hi_rx) -> j => match j { Ok(j) => j, Err(_) => return },
                 recv(lo_rx) -> j => match j { Ok(j) => j, Err(_) => return },
+                recv(th_rx) -> j => match j { Ok(j) => j, Err(_) => return },
             },
         };
         let send = |ev: LoadEvent| {
@@ -174,6 +200,17 @@ fn worker_loop(
                     send(LoadEvent::Prefetched { path });
                 }
                 // 預載失敗不回報：使用者真的翻到那張時會以高優先權重試並顯示錯誤
+            }
+            Job::Thumb { path } => {
+                // 縮圖失敗不回報事件，UI 端會維持「載入中」的佔位樣式
+                let r = catch_unwind(AssertUnwindSafe(|| crate::thumbs::make(&path)));
+                thumb_pending.lock().unwrap().remove(&path);
+                if let Ok(Some(image)) = r {
+                    send(LoadEvent::Thumb {
+                        path,
+                        image: Arc::new(image),
+                    });
+                }
             }
         }
     }
@@ -246,6 +283,16 @@ fn decode_streaming(
         return decode_raw_progressive(path, file_size, generation, latest_gen, send);
     }
 
+    // JPEG XR（Windows HDR 截圖）：HDR 來源併入色調映射路徑
+    if is_jxr(path) {
+        return decode_jxr(path, file_size, generation, send);
+    }
+
+    // HDR / EXR：保留浮點資料，套色調映射後才顯示
+    if is_hdr_file(path) {
+        return decode_hdr(path, file_size, generation, send);
+    }
+
     let kind = sniff_animation_kind(path, &ext);
     // 大 JPEG 走漸進式：先以 DCT 縮放解出低解析度版本，再補全解析度
     if kind.is_empty() && is_jpeg_file(path) {
@@ -284,10 +331,7 @@ fn decode_streaming(
         });
 
         let base = Arc::new(to_color_image_clamped(rgba));
-        let frame = FrameData {
-            image: base.clone(),
-            delay: Duration::ZERO,
-        };
+        let frame = FrameData::new(base.clone(), Duration::ZERO);
         send(LoadEvent::Frame {
             generation,
             index: 0,
@@ -302,6 +346,7 @@ fn decode_streaming(
 
         let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
         Ok(Decoded {
+            hdr: None,
             meta,
             frames: vec![frame],
             mips,
@@ -354,10 +399,7 @@ fn emit_static(
         meta: meta.clone(),
     });
     let base = Arc::new(to_color_image_clamped(rgba));
-    let frame = FrameData {
-        image: base.clone(),
-        delay: Duration::ZERO,
-    };
+    let frame = FrameData::new(base.clone(), Duration::ZERO);
     send(LoadEvent::Frame {
         generation,
         index: 0,
@@ -437,6 +479,7 @@ fn decode_jpeg_progressive(
         emit_static(path, full, orig_size, file_size, "JPEG", generation, send);
     let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
     Some(Ok(Decoded {
+        hdr: None,
         meta,
         frames: vec![frame],
         mips,
@@ -444,6 +487,184 @@ fn decode_jpeg_progressive(
         truncated: false,
         bytes,
     }))
+}
+
+/// JPEG XR：副檔名或檔頭（`II` + 0xBC，與一般 TIFF 的 `II` + 42 不同）
+fn is_jxr(path: &Path) -> bool {
+    if crate::jxr::is_jxr_path(path) {
+        return true;
+    }
+    let mut head = [0u8; 4];
+    File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut head)
+        })
+        .is_ok()
+        && crate::jxr::is_jxr_header(&head)
+}
+
+/// JPEG XR 解碼。HDR 來源（Windows 遊戲列的 HDR 截圖）走與 EXR 相同的
+/// 色調映射路徑，因此同樣支援曝光調整。
+fn decode_jxr(
+    path: &Path,
+    file_size: u64,
+    generation: u64,
+    send: &dyn Fn(LoadEvent),
+) -> Result<Decoded, String> {
+    match crate::jxr::decode(path)? {
+        crate::jxr::JxrImage::Hdr(mut hdr) => {
+            let max = max_tex_side() as usize;
+            while hdr.size[0] > max || hdr.size[1] > max {
+                hdr = hdr.halved();
+            }
+            emit_hdr(hdr, path, file_size, "JPEG XR (HDR)", generation, send)
+        }
+        crate::jxr::JxrImage::Sdr(rgba) => {
+            let orig_size = [rgba.width(), rgba.height()];
+            let (meta, frame, mips) = emit_static(
+                path, rgba, orig_size, file_size, "JPEG XR", generation, send,
+            );
+            let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
+            Ok(Decoded {
+                hdr: None,
+                meta,
+                frames: vec![frame],
+                mips,
+                complete: true,
+                truncated: false,
+                bytes,
+            })
+        }
+    }
+}
+
+/// 送出 HDR 影像的事件組並組出 Decoded（EXR 與 JXR 共用）
+fn emit_hdr(
+    hdr: crate::hdr::HdrImage,
+    path: &Path,
+    file_size: u64,
+    fmt: &str,
+    generation: u64,
+    send: &dyn Fn(LoadEvent),
+) -> Result<Decoded, String> {
+    let meta = ImageMeta {
+        path: path.to_path_buf(),
+        orig_size: [hdr.size[0] as u32, hdr.size[1] as u32],
+        file_size,
+        format: fmt.to_owned(),
+        animated: false,
+        has_alpha: true,
+    };
+    send(LoadEvent::Meta {
+        generation,
+        meta: meta.clone(),
+    });
+
+    let lut = crate::hdr::ToneLut::build(0.0, crate::hdr::ToneOp::Aces);
+    let base = Arc::new(crate::hdr::tonemap(&hdr, &lut));
+    let frame = FrameData::new(base.clone(), Duration::ZERO);
+    send(LoadEvent::Frame {
+        generation,
+        index: 0,
+        frame: frame.clone(),
+    });
+    let mips = build_mips(base);
+    send(LoadEvent::Mips {
+        generation,
+        mips: mips.clone(),
+    });
+
+    let hdr = Arc::new(hdr);
+    let bytes = Decoded::compute_bytes_with_hdr(std::slice::from_ref(&frame), &mips, Some(&hdr));
+    Ok(Decoded {
+        hdr: Some(hdr),
+        meta,
+        frames: vec![frame],
+        mips,
+        complete: true,
+        truncated: false,
+        bytes,
+    })
+}
+
+fn is_hdr_file(path: &Path) -> bool {
+    matches!(
+        ImageReader::open(path)
+            .ok()
+            .and_then(|r| r.with_guessed_format().ok())
+            .and_then(|r| r.format()),
+        Some(image::ImageFormat::OpenExr) | Some(image::ImageFormat::Hdr)
+    )
+}
+
+/// HDR / EXR 解碼：保留 f16 浮點原始資料，並以預設曝光做色調映射後顯示。
+///
+/// 之前的做法是直接 `into_rgba8()`——那只是把線性值截斷成 0–255、
+/// 完全沒做 gamma，而 egui 又把結果當 sRGB 解讀，導致整張明顯偏暗，
+/// 同時亮部細節全部糊成一片白。
+fn decode_hdr(
+    path: &Path,
+    file_size: u64,
+    generation: u64,
+    send: &dyn Fn(LoadEvent),
+) -> Result<Decoded, String> {
+    let reader = ImageReader::open(path)
+        .map_err(|e| format!("無法開啟檔案：{e}"))?
+        .with_guessed_format()
+        .map_err(err_str)?;
+    let fmt = match reader.format() {
+        Some(image::ImageFormat::OpenExr) => "OpenEXR",
+        _ => "Radiance HDR",
+    };
+    let img = reader.decode().map_err(err_str)?;
+    let mut hdr = crate::hdr::from_dynamic(&img).ok_or("這個檔案沒有浮點像素資料")?;
+
+    // 超過貼圖上限時在浮點域縮小（先壓亮度再縮會讓高光邊緣出現暗環）
+    let max = max_tex_side() as usize;
+    while hdr.size[0] > max || hdr.size[1] > max {
+        hdr = hdr.halved();
+    }
+
+    let orig_size = [hdr.size[0] as u32, hdr.size[1] as u32];
+    let meta = ImageMeta {
+        path: path.to_path_buf(),
+        orig_size,
+        file_size,
+        format: fmt.to_owned(),
+        animated: false,
+        has_alpha: true,
+    };
+    send(LoadEvent::Meta {
+        generation,
+        meta: meta.clone(),
+    });
+
+    let lut = crate::hdr::ToneLut::build(0.0, crate::hdr::ToneOp::Aces);
+    let base = Arc::new(crate::hdr::tonemap(&hdr, &lut));
+    let frame = FrameData::new(base.clone(), Duration::ZERO);
+    send(LoadEvent::Frame {
+        generation,
+        index: 0,
+        frame: frame.clone(),
+    });
+    let mips = build_mips(base);
+    send(LoadEvent::Mips {
+        generation,
+        mips: mips.clone(),
+    });
+
+    let hdr = Arc::new(hdr);
+    let bytes = Decoded::compute_bytes_with_hdr(std::slice::from_ref(&frame), &mips, Some(&hdr));
+    Ok(Decoded {
+        hdr: Some(hdr),
+        meta,
+        frames: vec![frame],
+        mips,
+        complete: true,
+        truncated: false,
+        bytes,
+    })
 }
 
 /// 只讀標頭取得 EXIF 方向
@@ -485,10 +706,7 @@ fn decode_raw_progressive(
             meta: meta.clone(),
         });
         let base = Arc::new(to_color_image_clamped(rgba));
-        let frame = FrameData {
-            image: base.clone(),
-            delay: Duration::ZERO,
-        };
+        let frame = FrameData::new(base.clone(), Duration::ZERO);
         send(LoadEvent::Frame {
             generation,
             index: 0,
@@ -512,6 +730,7 @@ fn decode_raw_progressive(
                 // 預覽已是全解析度等級，不必再花 CPU 顯影
                 let bytes = Decoded::compute_bytes(std::slice::from_ref(&r.1), &r.2);
                 return Ok(Decoded {
+                    hdr: None,
                     meta: r.0,
                     frames: vec![r.1],
                     mips: r.2,
@@ -528,6 +747,7 @@ fn decode_raw_progressive(
             let r = emit(rgba, "RAW");
             let bytes = Decoded::compute_bytes(std::slice::from_ref(&r.1), &r.2);
             return Ok(Decoded {
+                hdr: None,
                 meta: r.0,
                 frames: vec![r.1],
                 mips: r.2,
@@ -551,6 +771,7 @@ fn decode_raw_progressive(
 
     let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
     Ok(Decoded {
+        hdr: None,
         meta,
         frames: vec![frame],
         mips,
@@ -562,6 +783,11 @@ fn decode_raw_progressive(
 
 /// 預載：靜態圖全解（含 mip 鏈）；動畫只解第一格，翻到時再全解。
 fn decode_prefetch(path: &Path) -> Result<Decoded, String> {
+    // HDR 需要保留浮點資料與色調映射，預載路徑不處理；
+    // 使用者真的翻到時會由高優先權工作走完整流程（這類檔案本來就少見）
+    if is_jxr(path) || is_hdr_file(path) {
+        return Err("HDR 不預載".into());
+    }
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let ext = ext_lower(path);
     let ignore = |_: LoadEvent| {};
@@ -602,13 +828,11 @@ fn decode_prefetch(path: &Path) -> Result<Decoded, String> {
         let orig_size = [rgba.width(), rgba.height()];
         let has_alpha = rgba_has_alpha(&rgba);
         let base = Arc::new(to_color_image_clamped(rgba));
-        let frame = FrameData {
-            image: base.clone(),
-            delay: Duration::ZERO,
-        };
+        let frame = FrameData::new(base.clone(), Duration::ZERO);
         let mips = build_mips(base);
         let bytes = Decoded::compute_bytes(std::slice::from_ref(&frame), &mips);
         Ok(Decoded {
+            hdr: None,
             meta: ImageMeta {
                 path: path.to_path_buf(),
                 orig_size,
@@ -723,7 +947,16 @@ fn decode_animation(
             });
         }
         let ci = Arc::new(to_color_image_clamped(buf));
-        let fd = FrameData { image: ci, delay };
+        // 與前一格比對出變動矩形，讓 UI 端只需上傳變動的那一塊。
+        // 必須在 to_color_image_clamped 之後才算，否則座標會與貼圖對不上。
+        let dirty = frames
+            .last()
+            .and_then(|p: &FrameData| diff_rect(&p.image, &ci));
+        let fd = FrameData {
+            image: ci,
+            delay,
+            dirty,
+        };
         total_bytes += fd.bytes();
         send(LoadEvent::Frame {
             generation,
@@ -762,6 +995,7 @@ fn decode_animation(
 
     let bytes = Decoded::compute_bytes(&frames, &mips);
     Ok(Decoded {
+        hdr: None,
         meta,
         frames,
         mips,
@@ -776,6 +1010,23 @@ pub fn decode_static(path: &Path) -> Result<(RgbaImage, String), String> {
     // image crate 不支援的格式先走專用解碼器（JPEG XL / AVIF / HEIC / RAW）
     if let Some(fmt) = crate::extra_formats::sniff(path) {
         return crate::extra_formats::decode(path, fmt).map(|img| (img, fmt.name().to_owned()));
+    }
+
+    // JPEG XR：HDR 來源在這條路徑上先套預設色調映射轉成 8-bit
+    // （縮圖等用途需要的是可顯示的影像；完整 HDR 流程走 decode_streaming）
+    if is_jxr(path) {
+        return match crate::jxr::decode(path)? {
+            crate::jxr::JxrImage::Sdr(img) => Ok((img, "JPEG XR".to_owned())),
+            crate::jxr::JxrImage::Hdr(h) => {
+                let lut = crate::hdr::ToneLut::build(0.0, crate::hdr::ToneOp::Aces);
+                let ci = crate::hdr::tonemap(&h, &lut);
+                let mut out = RgbaImage::new(h.size[0] as u32, h.size[1] as u32);
+                for (px, c) in out.pixels_mut().zip(ci.pixels.iter()) {
+                    *px = image::Rgba([c.r(), c.g(), c.b(), c.a()]);
+                }
+                Ok((out, "JPEG XR (HDR)".to_owned()))
+            }
+        };
     }
 
     let reader = ImageReader::open(path)
@@ -813,9 +1064,26 @@ fn rgba_has_alpha(img: &RgbaImage) -> bool {
     img.as_raw().chunks_exact(4).any(|p| p[3] != 255)
 }
 
+/// 執行時偵測到的 GPU 貼圖邊長上限。UI 執行緒在每幀更新，
+/// 解碼執行緒讀取——用 atomic 避免額外的鎖。
+static MAX_TEX_SIDE: AtomicU32 = AtomicU32::new(MAX_TEX_DIM);
+
+/// 由 UI 端告知實際的貼圖上限（`ctx.input(|i| i.max_texture_side)`）
+pub fn set_max_tex_side(side: u32) {
+    // 太小的值必然是還沒初始化完成，忽略以免把圖縮爛
+    if side >= 2048 {
+        MAX_TEX_SIDE.store(side, AtomicOrdering::Relaxed);
+    }
+}
+
+pub fn max_tex_side() -> u32 {
+    MAX_TEX_SIDE.load(AtomicOrdering::Relaxed)
+}
+
 /// RgbaImage → egui ColorImage；超過 GPU 貼圖上限就逐次減半。
 pub fn to_color_image_clamped(mut rgba: RgbaImage) -> ColorImage {
-    while rgba.width() > MAX_TEX_DIM || rgba.height() > MAX_TEX_DIM {
+    let max = max_tex_side();
+    while rgba.width() > max || rgba.height() > max {
         rgba = half_rgba(&rgba);
     }
     let size = [rgba.width() as usize, rgba.height() as usize];
@@ -861,6 +1129,50 @@ pub fn build_mips(base: Arc<ColorImage>) -> Vec<Arc<ColorImage>> {
         mips.push(Arc::new(half_color_image(last)));
     }
     mips
+}
+
+/// 計算兩張同尺寸影像的變動矩形 `[x, y, w, h]`。
+///
+/// 動畫（尤其 GIF）通常每格只有一小塊在變，算出這塊就能只上傳那一部分。
+/// 尺寸不同時回傳 None（呼叫端應整張重傳）；完全相同時回傳 `[0,0,0,0]`。
+///
+/// 成本是一次全畫布比對（逐列先用 slice 比較快速略過未變動的列），
+/// 800×600 約 60–100µs，發生在背景解碼執行緒且每格只做一次。
+pub fn diff_rect(a: &ColorImage, b: &ColorImage) -> Option<[usize; 4]> {
+    if a.size != b.size {
+        return None;
+    }
+    let [w, h] = a.size;
+    if w == 0 || h == 0 {
+        return Some([0, 0, 0, 0]);
+    }
+    let (mut min_x, mut min_y) = (w, h);
+    let (mut max_x, mut max_y) = (0usize, 0usize);
+    for y in 0..h {
+        let ra = &a.pixels[y * w..(y + 1) * w];
+        let rb = &b.pixels[y * w..(y + 1) * w];
+        if ra == rb {
+            continue; // 整列相同，快速略過
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        max_y = y;
+        let first = ra.iter().zip(rb).position(|(p, q)| p != q).unwrap_or(0);
+        let last = w
+            - 1
+            - ra.iter()
+                .rev()
+                .zip(rb.iter().rev())
+                .position(|(p, q)| p != q)
+                .unwrap_or(0);
+        min_x = min_x.min(first);
+        max_x = max_x.max(last);
+    }
+    if min_y > max_y {
+        return Some([0, 0, 0, 0]); // 完全相同
+    }
+    Some([min_x, min_y, max_x - min_x + 1, max_y - min_y + 1])
 }
 
 /// 2×2 箱形濾波減半（egui Color32，預乘 alpha 下逐通道平均即正確）

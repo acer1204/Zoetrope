@@ -1,6 +1,6 @@
 [package]
 name = "zoetrope"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "走馬燈 — 極速跨平台看圖軟體：GPU 渲染、串流動畫解碼、資料夾惰性載入"
 license = "AGPL-3.0-only"
@@ -21,11 +21,22 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 
 # 額外格式解碼器（全部純 Rust，免 C 相依）
+half = "2"                                          # HDR/EXR 的 f16 像素儲存
 jpeg-decoder = "0.3"                                # JPEG DCT 縮放解碼（漸進式載入用）
 jxl-oxide = "0.12"                                  # JPEG XL
 heic = { version = "0.1", features = ["av1"] }      # HEIC/HEIF（HEVC）+ AVIF
 rawloader = "0.37"                                  # 相機 RAW：CR2/NEF/ARW/DNG…
 imagepipe = "0.5"                                   # RAW → sRGB 影像管線
+
+# JPEG XR（.jxr）走 Windows 內建的 WIC——原生支援、純 Rust 綁定、
+# 不需要任何 C 建置（jpegxr crate 需要 libclang 與 MSVC SAL 修補）
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

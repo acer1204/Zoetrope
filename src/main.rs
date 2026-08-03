@@ -30,6 +30,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         renderer,
         persist_window: true,
+        wgpu_options: wgpu_config(),
         viewport: egui::ViewportBuilder::default()
             .with_title("Zoetrope")
             .with_inner_size([1280.0, 800.0])
@@ -96,6 +97,42 @@ fn install_cjk_fonts(ctx: &egui::Context) {
             ctx.set_fonts(fonts);
             return;
         }
+    }
+}
+
+/// 我們願意要求的最大貼圖邊長。egui-wgpu 預設把
+/// `max_texture_dimension_2d` 寫死成 8192（不查硬體），
+/// 導致超過 8192px 的圖一律被縮小、1:1 檢視變糊。
+/// 這裡改成「硬體支援多少就要多少」，上限 16384——
+/// 絕大多數桌面 GPU 都支援，可讓一般大圖完全不必降階。
+const WANTED_MAX_TEXTURE: u32 = 16384;
+
+fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::wgpu;
+    eframe::egui_wgpu::WgpuConfiguration {
+        device_descriptor: std::sync::Arc::new(|adapter: &wgpu::Adapter| {
+            let base = if adapter.get_info().backend == wgpu::Backend::Gl {
+                wgpu::Limits::downlevel_webgl2_defaults()
+            } else {
+                wgpu::Limits::default()
+            };
+            // 不能要求超過硬體上限，否則裝置建立會失敗；
+            // 也不要低於 egui-wgpu 原本要求的 8192。
+            let want = adapter
+                .limits()
+                .max_texture_dimension_2d
+                .clamp(8192, WANTED_MAX_TEXTURE);
+            wgpu::DeviceDescriptor {
+                label: Some("zoetrope wgpu device"),
+                required_features: wgpu::Features::default(),
+                required_limits: wgpu::Limits {
+                    max_texture_dimension_2d: want,
+                    ..base
+                },
+                memory_hints: wgpu::MemoryHints::default(),
+            }
+        }),
+        ..Default::default()
     }
 }
 

@@ -106,6 +106,12 @@ impl<'a> Tiff<'a> {
     }
 }
 
+/// 對外公開的 TIFF 掃描（縮圖模組拿它找 EXIF 內嵌縮圖，
+/// 傳入的 slice 需以 TIFF header 起始）
+pub fn scan_tiff_spans(data: &[u8]) -> Vec<JpegSpan> {
+    scan_tiff(data)
+}
+
 /// 掃描 TIFF 系 RAW，回傳所有找得到的 JPEG 區段
 fn scan_tiff(data: &[u8]) -> Vec<JpegSpan> {
     if data.len() < 8 {
