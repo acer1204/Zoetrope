@@ -67,24 +67,52 @@ fn main() {
         100.0 * over1 as f64 / src.len() as f64
     );
 
-    println!("\n輸出 R 通道分佈：");
+    // 飽和度：(max-min)/max，在線性空間量。逐通道壓縮會把它拉低——
+    // 這正是「膚色偏白」在數字上的樣子。
+    let to_linear = |v: u8| {
+        let x = v as f32 / 255.0;
+        if x <= 0.040_45 {
+            x / 12.92
+        } else {
+            ((x + 0.055) / 1.055).powf(2.4)
+        }
+    };
+
+    println!("\n輸出 R 通道分佈（sat = 亮部平均飽和度，ms = 映射耗時）：");
     println!(
-        "{:<22} {:>5} {:>5} {:>5} {:>5} {:>5}",
-        "設定", "p01", "p25", "p50", "p90", "p99"
+        "{:<22} {:>5} {:>5} {:>5} {:>5} {:>5} {:>6} {:>7}",
+        "設定", "p01", "p25", "p50", "p90", "p99", "sat", "ms"
     );
     let show = |label: String, ev: f32, op: ToneOp| {
         let lut = hdr::ToneLut::build(ev, op);
+        let t = std::time::Instant::now();
         let out = hdr::tonemap(&img, &lut);
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+
         let mut v: Vec<u8> = out.pixels.iter().step_by(37).map(|c| c.r()).collect();
         v.sort_unstable();
+
+        let mut sat = 0.0f64;
+        let mut n = 0u64;
+        for c in out.pixels.iter().step_by(37) {
+            let l = [to_linear(c.r()), to_linear(c.g()), to_linear(c.b())];
+            let max = l[0].max(l[1]).max(l[2]);
+            // 只統計亮部：暗部的飽和度受量化雜訊影響太大
+            if max > 0.2 {
+                sat += ((max - l[0].min(l[1]).min(l[2])) / max) as f64;
+                n += 1;
+            }
+        }
         println!(
-            "{:<22} {:>5} {:>5} {:>5} {:>5} {:>5}",
+            "{:<22} {:>5} {:>5} {:>5} {:>5} {:>5} {:>6.3} {:>7.1}",
             label,
             pct_u8(&mut v, 1),
             pct_u8(&mut v, 25),
             pct_u8(&mut v, 50),
             pct_u8(&mut v, 90),
-            pct_u8(&mut v, 99)
+            pct_u8(&mut v, 99),
+            if n > 0 { sat / n as f64 } else { 0.0 },
+            ms
         );
     };
 

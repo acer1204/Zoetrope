@@ -17,6 +17,20 @@
 //! 整條管線就塌縮成一次查表。實測 4K 降到 8–17ms，
 //! 重建 LUT 只要約 1ms——拉曝光滑桿完全即時，且不需要 GPU shader，
 //! wgpu 與 glow 兩個後端行為一致。
+//!
+//! # 為什麼還有第二條路徑
+//!
+//! 逐通道壓縮會**破壞色彩**：膚色的 R 遠大於 G、B，當 R 進入曲線的肩部
+//! 被壓縮、而 G/B 還在拐點以下不動時，RGB 的比例就跑掉了，畫面往灰白靠。
+//!
+//! 量測 Windows 相簿證實它不是逐通道的：scRGB 的 R=4.0 在中性色塊被畫成
+//! 236，在 (4.0, 1.0, 0.5) 卻畫成 255——同一個通道值、不同的輸出，代表
+//! 映射會參考其他通道。實際比對三種模型後，相簿的行為對應到
+//! **「曲線作用在亮度上，三通道同乘一個比例」**（見 tests/hdr_scrgb_match.rs）。
+//!
+//! 這條路徑跨通道，沒辦法塌縮成一維表，只好保留 `powf` 的部分改用
+//! sRGB 編碼小表 + 多執行緒攤平。純灰階時兩條路徑的結果完全相同，
+//! 所以先前用灰階階梯量到的曲線仍然成立。
 
 use eframe::egui::ColorImage;
 
@@ -123,15 +137,20 @@ pub fn f32_to_f16(v: f32) -> u16 {
     half::f16::from_f32(v).to_bits()
 }
 
-/// 色調映射運算子。全部都是「逐通道」形式，才能塌縮成一維查表——
-/// 像 Khronos PBR Neutral 那種需要 min/max(rgb) 的運算子無法用 LUT。
+/// 色調映射運算子。除了 `Soft` 之外都是「逐通道」形式，可以塌縮成一維查表。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ToneOp {
-    /// **柔和肩部**：中間調維持原樣，只在高光處滾降。
+    /// **柔和肩部**：中間調維持原樣，只在高光處滾降，且**保持色度**。
     ///
-    /// 這條曲線是量測 Windows 相簿的實際輸出擬合出來的——中間調完全是
-    /// 恆等（所以亮度與相簿一致），超過拐點後接一段 Reinhard 形式的肩部，
-    /// 讓極亮處不會硬切成死白。顯示參考內容（HDR 截圖）的預設值。
+    /// 曲線本身是量測 Windows 相簿的灰階輸出擬合出來的——中間調完全是
+    /// 恆等（所以亮度與相簿一致），超過拐點後接一段 Reinhard 形式的肩部。
+    ///
+    /// 關鍵在於它作用的對象是**亮度**而不是各個通道：算出 Rec.709 亮度 Y，
+    /// 求 `Soft(Y)/Y`，三個通道同乘這個比例。RGB 的比例因此完全不變，
+    /// 膚色不會在變亮的同時褪成灰白。超出 1.0 的通道直接截斷——相簿也是
+    /// 這樣做的（實測 (4.0, 1.0, 0.5) 的 R 就是 255）。
+    ///
+    /// 顯示參考內容（HDR 截圖）的預設值。
     Soft,
     /// Narkowicz 的 ACES 近似式，電影感、對比較強
     Aces,
@@ -145,6 +164,11 @@ pub enum ToneOp {
 /// 0.5 是擬合相簿實測資料得到的（10 個取樣點誤差都在 3/255 以內）。
 const SOFT_KNEE: f32 = 0.5;
 
+/// Rec.709 / sRGB 的亮度係數
+const LUMA_R: f32 = 0.2126;
+const LUMA_G: f32 = 0.7152;
+const LUMA_B: f32 = 0.0722;
+
 impl ToneOp {
     pub fn name(self) -> &'static str {
         match self {
@@ -153,6 +177,12 @@ impl ToneOp {
             ToneOp::Reinhard => "Reinhard",
             ToneOp::Clip => "截斷",
         }
+    }
+
+    /// 曲線是否作用在亮度上（保持 RGB 比例），而非逐通道套用。
+    /// 逐通道會讓最亮的通道被壓得最多，於是彩色往灰白靠。
+    pub fn preserves_chroma(self) -> bool {
+        matches!(self, ToneOp::Soft)
     }
 
     #[inline]
@@ -193,11 +223,38 @@ fn srgb_encode(x: f32) -> f32 {
     }
 }
 
-/// 把「曝光 → 色調映射 → sRGB 編碼」整條管線預先算成查表。
-/// 索引是 f16 的 bit pattern，因此涵蓋所有可能的來源值。
+/// sRGB 編碼小表的長度。保色度路徑的輸入是算出來的浮點值而非 f16，
+/// 沒辦法用 bit pattern 當索引，只好改成均勻取樣。
+///
+/// sRGB 編碼在近黑處最陡（斜率 12.92），這裡的量化誤差最大：
+/// 12.92 / 16384 × 255 ≈ 0.2 階，遠小於 1，不會造成色帶。
+const SRGB_TAB: usize = 16384;
+
+/// 來源清理：NaN、負值、無限大一律視為 0，避免壞資料變成雜訊。
+/// scRGB 允許負值表示超出 sRGB 色域的顏色，我們沒有做色域映射，就當黑處理。
+#[inline]
+fn sanitize(v: f32) -> f32 {
+    if v.is_finite() && v > 0.0 {
+        v
+    } else {
+        0.0
+    }
+}
+
+/// 把「曝光 → 色調映射 → sRGB 編碼」預先算成查表。
+enum LutKind {
+    /// 逐通道運算子：整條管線塌縮成一張表，索引是 f16 的 bit pattern
+    PerChannel { color: Box<[u8; 65536]> },
+    /// 保色度運算子：跨通道，只能把 sRGB 編碼查表化
+    Chroma {
+        gain: f32,
+        op: ToneOp,
+        srgb: Box<[u8; SRGB_TAB]>,
+    },
+}
+
 pub struct ToneLut {
-    /// 顏色通道：含曝光、tonemap 與 gamma
-    color: Box<[u8; 65536]>,
+    kind: LutKind,
     /// alpha 通道：只做 clamp，不套 tonemap 也不做 gamma
     alpha: Box<[u8; 65536]>,
 }
@@ -205,22 +262,42 @@ pub struct ToneLut {
 impl ToneLut {
     pub fn build(exposure_ev: f32, op: ToneOp) -> Self {
         let gain = 2f32.powf(exposure_ev);
-        let mut color = Box::new([0u8; 65536]);
         let mut alpha = Box::new([0u8; 65536]);
         for bits in 0..=u16::MAX {
-            let v = f16_to_f32(bits);
-            // NaN / 負值一律視為 0，避免壞資料造成雜訊
-            let v = if v.is_finite() && v > 0.0 { v } else { 0.0 };
-            let c = srgb_encode(op.apply(v * gain));
-            color[bits as usize] = (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            let v = sanitize(f16_to_f32(bits));
             alpha[bits as usize] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         }
-        Self { color, alpha }
+
+        let kind = if op.preserves_chroma() {
+            let mut srgb = Box::new([0u8; SRGB_TAB]);
+            for (i, slot) in srgb.iter_mut().enumerate() {
+                let x = i as f32 / (SRGB_TAB - 1) as f32;
+                *slot = (srgb_encode(x) * 255.0 + 0.5) as u8;
+            }
+            LutKind::Chroma { gain, op, srgb }
+        } else {
+            let mut color = Box::new([0u8; 65536]);
+            for bits in 0..=u16::MAX {
+                let v = sanitize(f16_to_f32(bits));
+                let c = srgb_encode(op.apply(v * gain));
+                color[bits as usize] = (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+            LutKind::PerChannel { color }
+        };
+        Self { kind, alpha }
     }
 
+    /// 單一通道的查表值。只有逐通道路徑才有意義——保色度路徑的輸出
+    /// 取決於同一像素的其他通道，無法單獨查表，這裡回傳中性灰的結果。
     #[inline]
     pub fn color(&self, bits: u16) -> u8 {
-        self.color[bits as usize]
+        match &self.kind {
+            LutKind::PerChannel { color } => color[bits as usize],
+            LutKind::Chroma { gain, op, srgb } => {
+                // R=G=B 時亮度就等於該值，比例為 1，等同直接套曲線
+                encode(srgb, op.apply(sanitize(f16_to_f32(bits)) * gain))
+            }
+        }
     }
 
     #[inline]
@@ -229,17 +306,71 @@ impl ToneLut {
     }
 }
 
+/// 線性值 → 8-bit sRGB。`f32 as usize` 在 Rust 是飽和轉換：
+/// 負值變 0、過大值變 usize::MAX，所以只需要一次上界夾取。
+#[inline]
+fn encode(tab: &[u8; SRGB_TAB], v: f32) -> u8 {
+    let i = (v * (SRGB_TAB - 1) as f32) as usize;
+    tab[i.min(SRGB_TAB - 1)]
+}
+
+/// 低於這個像素數就不開執行緒——縮圖與 mip 尾端的圖太小，
+/// 建立執行緒的成本反而超過計算本身。
+const PARALLEL_MIN_PX: usize = 1 << 20;
+
 /// 套用查表產生可顯示的 8-bit 影像
 pub fn tonemap(hdr: &HdrImage, lut: &ToneLut) -> ColorImage {
     let [w, h] = hdr.size;
     let mut out = vec![0u8; w * h * 4];
-    for (o, s) in out.chunks_exact_mut(4).zip(hdr.px.chunks_exact(4)) {
-        o[0] = lut.color(s[0]);
-        o[1] = lut.color(s[1]);
-        o[2] = lut.color(s[2]);
-        o[3] = lut.alpha(s[3]);
+
+    // 保色度路徑跨通道，沒辦法只靠查表，成本高出數倍——切列平行處理補回來。
+    let threads = if w * h >= PARALLEL_MIN_PX && matches!(lut.kind, LutKind::Chroma { .. }) {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8)
+    } else {
+        1
+    };
+
+    if threads <= 1 {
+        map_span(&mut out, &hdr.px, lut);
+    } else {
+        let span = h.div_ceil(threads) * w * 4;
+        std::thread::scope(|s| {
+            for (o, i) in out.chunks_mut(span).zip(hdr.px.chunks(span)) {
+                s.spawn(move || map_span(o, i, lut));
+            }
+        });
     }
     ColorImage::from_rgba_unmultiplied([w, h], &out)
+}
+
+fn map_span(out: &mut [u8], px: &[u16], lut: &ToneLut) {
+    match &lut.kind {
+        LutKind::PerChannel { color } => {
+            for (o, s) in out.chunks_exact_mut(4).zip(px.chunks_exact(4)) {
+                o[0] = color[s[0] as usize];
+                o[1] = color[s[1] as usize];
+                o[2] = color[s[2] as usize];
+                o[3] = lut.alpha[s[3] as usize];
+            }
+        }
+        LutKind::Chroma { gain, op, srgb } => {
+            for (o, s) in out.chunks_exact_mut(4).zip(px.chunks_exact(4)) {
+                let r = sanitize(f16_to_f32(s[0])) * gain;
+                let g = sanitize(f16_to_f32(s[1])) * gain;
+                let b = sanitize(f16_to_f32(s[2])) * gain;
+                // 曲線只作用在亮度上，三通道同乘同一個比例 → RGB 比例不變
+                let y = LUMA_R * r + LUMA_G * g + LUMA_B * b;
+                let ratio = if y > 0.0 { op.apply(y) / y } else { 0.0 };
+                o[0] = encode(srgb, r * ratio);
+                o[1] = encode(srgb, g * ratio);
+                o[2] = encode(srgb, b * ratio);
+                o[3] = lut.alpha[s[3] as usize];
+            }
+        }
+    }
 }
 
 /// DynamicImage 的浮點變體 → HdrImage（EXR/Radiance 皆為場景參考）。

@@ -24,6 +24,49 @@ fn single(v: f32, kind: HdrKind) -> HdrImage {
     }
 }
 
+fn rgb(r: f32, g: f32, b: f32, kind: HdrKind) -> HdrImage {
+    HdrImage {
+        size: [1, 1],
+        px: vec![
+            hdr::f32_to_f16(r),
+            hdr::f32_to_f16(g),
+            hdr::f32_to_f16(b),
+            hdr::f32_to_f16(1.0),
+        ],
+        kind,
+    }
+}
+
+/// 用預設設定（-1.5 EV + 柔和）映射一個顏色，回傳 8-bit sRGB
+fn map_default(r: f32, g: f32, b: f32) -> [u8; 3] {
+    let kind = HdrKind::DisplayReferred;
+    let lut = hdr::ToneLut::build(kind.default_exposure_ev(), kind.default_tone_op());
+    let p = hdr::tonemap(&rgb(r, g, b, kind), &lut).pixels[0];
+    [p.r(), p.g(), p.b()]
+}
+
+/// sRGB 8-bit → 線性，用來檢查色度而不是編碼後的數值
+fn to_linear(v: u8) -> f32 {
+    let x = v as f32 / 255.0;
+    if x <= 0.040_45 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// 飽和度：(max - min) / max，在線性空間量
+fn saturation(c: [u8; 3]) -> f32 {
+    let l = [to_linear(c[0]), to_linear(c[1]), to_linear(c[2])];
+    let max = l[0].max(l[1]).max(l[2]);
+    let min = l[0].min(l[1]).min(l[2]);
+    if max <= 0.0 {
+        0.0
+    } else {
+        (max - min) / max
+    }
+}
+
 #[test]
 fn display_referred_defaults_to_soft_not_aces() {
     assert_eq!(HdrKind::DisplayReferred.default_tone_op(), ToneOp::Soft);
@@ -66,6 +109,142 @@ fn matches_windows_photos_measured_output() {
         );
     }
     eprintln!("與相簿的最大偏差：{worst}/255");
+}
+
+/// **彩色**回歸測試。灰階量不出色彩行為——中性色上「逐通道」與「亮度等比」
+/// 的結果完全相同，所以前一版才會通過所有灰階測試卻把膚色映射成灰白。
+///
+/// 期望值同樣是實測來的：產生一張已知 scRGB 的彩色色塊圖，用相簿開啟，
+/// 再從畫面讀回每一塊的顏色（見 scratchpad 的 colorwedge/readcolorruns）。
+///
+/// 決定性的觀察在前兩筆：scRGB 的 R=4.0 在中性色塊被畫成 236，
+/// 在 (4.0, 1.0, 0.5) 卻是 255。同一個通道值有兩種輸出，
+/// 證明相簿的映射會參考其他通道，不可能是逐通道的。
+#[test]
+fn matches_windows_photos_on_colour() {
+    // (scRGB R, G, B, 相簿實際畫出的 sRGB)
+    let cases = [
+        (4.0f32, 4.0, 4.0, [236u8, 236, 236]), // 中性對照：重現灰階階梯的量測值
+        (4.0, 1.0, 0.5, [255, 161, 118]),      // 同一個 R=4.0，輸出卻是 255
+        (2.0, 2.0, 2.0, [213, 213, 213]),      // 中性對照
+        (2.0, 1.0, 0.7, [220, 161, 137]),      // 亮膚色
+        (3.0, 1.8, 1.4, [255, 205, 184]),      // 更亮的膚色
+        (2.5, 1.5, 1.1, [242, 193, 168]),      // 典型亮部膚色
+        (1.5, 0.9, 0.7, [193, 154, 137]),      // 中間調膚色
+        (1.0, 0.5, 0.25, [161, 118, 85]),      // 拐點以下，不受曲線影響
+        (6.0, 0.3, 0.3, [255, 93, 93]),        // 飽和紅高光
+        (0.3, 0.3, 6.0, [92, 93, 255]),        // 飽和藍高光
+    ];
+
+    let mut worst = 0u8;
+    for (r, g, b, expect) in cases {
+        let got = map_default(r, g, b);
+        for c in 0..3 {
+            worst = worst.max(got[c].abs_diff(expect[c]));
+        }
+        assert!(
+            (0..3).all(|c| got[c].abs_diff(expect[c]) <= 6),
+            "來源 ({r}, {g}, {b}) 應輸出約 {expect:?}（相簿實測值），實際 {got:?}"
+        );
+    }
+    eprintln!("彩色色塊與相簿的最大偏差：{worst}/255");
+}
+
+/// 這一條直指使用者回報的症狀：「膚色偏白，相簿看起來紅潤」。
+///
+/// 逐通道壓縮會把最亮的通道壓得最多。膚色的 R 遠大於 G、B，於是 R 被拉低、
+/// G/B 幾乎不動，比例跑掉 → 往灰白靠。亮度等比則三通道同乘一個數，比例不變。
+#[test]
+fn soft_keeps_skin_saturated_where_per_channel_washes_it_out() {
+    let (r, g, b) = (3.0f32, 1.8, 1.4); // 亮部膚色
+    let kind = HdrKind::DisplayReferred;
+    let ev = kind.default_exposure_ev();
+
+    let soft = map_default(r, g, b);
+    let per_channel = {
+        let lut = hdr::ToneLut::build(ev, ToneOp::Aces); // ACES 是逐通道的
+        let p = hdr::tonemap(&rgb(r, g, b, kind), &lut).pixels[0];
+        [p.r(), p.g(), p.b()]
+    };
+
+    assert!(
+        saturation(soft) > saturation(per_channel) * 1.2,
+        "保色度的飽和度應明顯高於逐通道：{:.3} vs {:.3}（{soft:?} / {per_channel:?}）",
+        saturation(soft),
+        saturation(per_channel)
+    );
+
+    // 更直接的說法：紅相對綠的強度。逐通道把 R 壓掉，於是膚色褪成灰白。
+    let ratio = |c: [u8; 3]| to_linear(c[0]) / to_linear(c[1]);
+    let want = r / g; // 來源的 R:G
+    assert!(
+        (ratio(soft) - want).abs() < 0.05,
+        "保色度應維持來源的 R:G = {want:.3}，實際 {:.3}",
+        ratio(soft)
+    );
+    assert!(
+        ratio(per_channel) < want - 0.15,
+        "逐通道應明顯拉低 R:G（這就是偏白的成因），實際 {:.3}",
+        ratio(per_channel)
+    );
+}
+
+/// 沒有任何通道溢出時，線性 RGB 的比例必須原封不動——這是「保色度」的定義
+#[test]
+fn soft_preserves_linear_ratios_when_nothing_clips() {
+    // (3.0, 1.8, 1.4) 經 -1.5 EV 後亮度 0.716 已進入肩部，
+    // 但最大通道映射後仍在 1.0 以下，所以不會被截斷
+    let (r, g, b) = (3.0f32, 1.8, 1.4);
+    let out = map_default(r, g, b);
+    assert!(out.iter().all(|&c| c < 255), "這組不該有通道到頂：{out:?}");
+
+    let lin = [to_linear(out[0]), to_linear(out[1]), to_linear(out[2])];
+    let src = [r, g, b];
+    for c in 1..3 {
+        let want = src[c] / src[0];
+        let have = lin[c] / lin[0];
+        assert!(
+            (want - have).abs() < 0.02,
+            "通道 {c} 的比例應維持 {want:.3}，實際 {have:.3}"
+        );
+    }
+}
+
+/// 已知落差：極端飽和的高光（單一通道 6~8、其餘約 0.3）。
+///
+/// 相簿在通道被截斷之後還會補回一部分飽和度，我們沒有跟進——實測的補償量
+/// 換算成線性後落在 0.06~0.25 之間，並不是一個一致的常數，硬擬合只會過擬合
+/// 這十幾個樣本。這條測試把現況的落差鎖起來，避免哪天無意間變得更差。
+#[test]
+fn known_gap_on_extreme_saturated_highlights() {
+    // (scRGB, 相簿實測, 我們目前的偏差上限)
+    let cases = [
+        (8.0f32, 2.0, 1.0, [255u8, 197, 146], 14u8),
+        (0.3, 6.0, 0.3, [100, 255, 91], 34),
+    ];
+    for (r, g, b, photos, limit) in cases {
+        let got = map_default(r, g, b);
+        let diff = (0..3).map(|c| got[c].abs_diff(photos[c])).max().unwrap();
+        assert!(
+            diff <= limit,
+            "({r}, {g}, {b}) 與相簿的落差不該超過 {limit}，實際 {diff}（{got:?} vs {photos:?}）"
+        );
+        // 被截斷的通道本身仍必須對得上
+        let ch = if g > r { 1 } else { 0 };
+        assert_eq!(got[ch], photos[ch], "主通道應與相簿一致：{got:?}");
+    }
+}
+
+/// 保色度路徑要能安全處理壞資料與全黑像素（除以亮度時的邊界）
+#[test]
+fn chroma_path_handles_black_and_bad_pixels() {
+    assert_eq!(map_default(0.0, 0.0, 0.0), [0, 0, 0], "全黑應維持全黑");
+    assert_eq!(map_default(-2.0, -2.0, -2.0), [0, 0, 0], "負值視為黑");
+    assert_eq!(map_default(f32::NAN, f32::NAN, f32::NAN), [0, 0, 0]);
+    // 單一通道為 NaN 不該污染其他通道
+    let mixed = map_default(f32::NAN, 1.0, 0.5);
+    assert_eq!(mixed[0], 0, "NaN 通道應為 0，實際 {mixed:?}");
+    assert!(mixed[1] > 0 && mixed[2] > 0, "其他通道應正常：{mixed:?}");
 }
 
 /// 高光滾降是「柔和」曲線存在的理由——硬截斷在皮膚等明亮區域會明顯偏亮
