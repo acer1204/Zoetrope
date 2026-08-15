@@ -4,8 +4,10 @@ use std::time::Instant;
 
 use zoetrope::jpeg_fast;
 
-fn tmp() -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("zoetrope-jprog-{}", std::process::id()));
+/// 每個測試自己的暫存目錄。測試平行執行且結尾各自 remove_dir_all，
+/// 共用目錄會被先跑完的測試連根刪掉，所以 tag 必須每個測試唯一。
+fn tmp(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("zoetrope-jprog-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
@@ -30,7 +32,7 @@ fn big_jpeg(dir: &std::path::Path, w: u32, h: u32) -> std::path::PathBuf {
 
 #[test]
 fn dct_scaling_is_substantially_faster() {
-    let dir = tmp();
+    let dir = tmp("dct");
     let path = big_jpeg(&dir, 6000, 4000);
 
     // 全解析度
@@ -102,7 +104,7 @@ fn small_images_skip_progressive_path() {
 /// 主解碼路徑對大 JPEG 的最終結果必須是全解析度
 #[test]
 fn main_path_ends_at_full_resolution() {
-    let dir = tmp();
+    let dir = tmp("stages");
     let path = big_jpeg(&dir, 4096, 3072);
     let (img, fmt) = zoetrope::loader::decode_static(&path).expect("主路徑解碼");
     assert_eq!(fmt, "JPEG");

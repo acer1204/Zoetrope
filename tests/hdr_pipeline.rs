@@ -7,13 +7,18 @@ use std::time::Instant;
 
 use zoetrope::hdr::{self, ToneOp};
 
-fn tmp() -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("zoetrope-hdr-{}", std::process::id()));
+/// 每個測試自己的暫存目錄。測試平行執行且結尾各自 remove_dir_all，
+/// 共用目錄會被先跑完的測試連根刪掉，所以 tag 必須每個測試唯一。
+fn tmp(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("zoetrope-hdr-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
 
-/// 產生一張有明確亮度階梯的 EXR：從 0.01 到 64.0，橫跨 12 個 stop
+/// 產生一張有明確亮度階梯的 EXR：從 0.01 到 64.0，橫跨 12 個 stop。
+///
+/// 檔名帶上尺寸——測試是平行跑的，而同一個執行檔裡 PID 相同，
+/// 共用檔名會讓一個測試讀到另一個測試寫到一半的檔案。
 fn make_exr(dir: &std::path::Path, w: u32, h: u32) -> std::path::PathBuf {
     let img = image::Rgb32FImage::from_fn(w, h, |x, _| {
         // 每一欄一個亮度，指數分布
@@ -21,7 +26,7 @@ fn make_exr(dir: &std::path::Path, w: u32, h: u32) -> std::path::PathBuf {
         let v = 0.01f32 * (64.0f32 / 0.01).powf(t);
         image::Rgb([v, v, v])
     });
-    let p = dir.join("steps.exr");
+    let p = dir.join(format!("steps-{w}x{h}.exr"));
     image::DynamicImage::ImageRgb32F(img)
         .save_with_format(&p, image::ImageFormat::OpenExr)
         .unwrap();
@@ -30,7 +35,7 @@ fn make_exr(dir: &std::path::Path, w: u32, h: u32) -> std::path::PathBuf {
 
 #[test]
 fn exr_decodes_to_float_and_tonemaps_correctly() {
-    let dir = tmp();
+    let dir = tmp("tonemap");
     let path = make_exr(&dir, 64, 8);
 
     // 解碼保留浮點
@@ -99,7 +104,7 @@ fn exr_decodes_to_float_and_tonemaps_correctly() {
 
 #[test]
 fn main_decode_path_handles_exr() {
-    let dir = tmp();
+    let dir = tmp("decode");
     let path = make_exr(&dir, 32, 32);
     // 主解碼入口目前對 HDR 仍回 8-bit（decode_static 是舊路徑），
     // 真正的 HDR 流程在 decode_streaming；這裡只確認不會出錯
@@ -111,7 +116,7 @@ fn main_decode_path_handles_exr() {
 /// 曝光調整必須夠快才能做成即時滑桿
 #[test]
 fn exposure_adjustment_is_fast_enough_for_a_slider() {
-    let dir = tmp();
+    let dir = tmp("slider");
     // 4K 等級
     let path = make_exr(&dir, 2048, 1080);
     let img = image::open(&path).expect("EXR 解碼");
