@@ -275,6 +275,10 @@ pub struct ViewerApp {
     /// 需要把目前索引捲進可見範圍（翻頁後觸發）
     strip_scroll_to_current: bool,
 
+    /// 本幀已經畫過、但邏輯上已被換掉的圖，延到下一幀開頭才釋放。
+    /// 原因與不變式見 `crate::deferred`。
+    retired: crate::deferred::Bin<CurrentImage>,
+
     prefs: Prefs,
 }
 
@@ -344,6 +348,7 @@ impl ViewerApp {
             thumb_tex: std::collections::HashMap::new(),
             strip_pinned: false,
             strip_scroll_to_current: false,
+            retired: Default::default(),
             prefs,
         };
         if let Some(p) = initial {
@@ -361,7 +366,7 @@ impl ViewerApp {
             self.generation += 1;
             self.entries = Vec::new();
             self.have_dir = false;
-            self.current = None;
+            self.replace_current(None);
             self.incoming = None;
             self.awaiting = false;
             self.load_started = None;
@@ -417,6 +422,13 @@ impl ViewerApp {
     }
 
     /// 把影像換到畫面上（重置播放狀態），並結束等待中的載入
+    /// 換掉畫面上的圖。**所有**要讓 `current` 消失的地方都必須走這裡，
+    /// 不能直接指派——舊圖的貼圖本幀可能已經畫過，得延到下一幀才能釋放
+    /// （原因見 `crate::deferred`）。
+    fn replace_current(&mut self, next: Option<CurrentImage>) {
+        self.retired.replace(&mut self.current, next);
+    }
+
     fn show(&mut self, img: CurrentImage) {
         // HDR 的預設曲線依來源與內容而定（見 HdrImage::recommended_tone_op），
         // 換圖時一併重置曝光，避免上一張的設定套到不同性質的來源上
@@ -424,7 +436,7 @@ impl ViewerApp {
             self.tone_op = h.recommended_tone_op();
             self.exposure_ev = h.kind.default_exposure_ev();
         }
-        self.current = Some(img);
+        self.replace_current(Some(img));
         self.incoming = None;
         self.awaiting = false;
         self.load_started = None;
@@ -665,7 +677,7 @@ impl ViewerApp {
                         self.awaiting = false;
                         self.incoming = None;
                         self.load_started = None;
-                        self.current = None;
+                        self.replace_current(None);
                         self.update_title(ctx);
                     }
                 }
@@ -2036,6 +2048,10 @@ impl eframe::App for ViewerApp {
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // 上一幀退役的圖，現在釋放才安全：那一幀的繪製指令早已送出 GPU。
+        // 這必須是本幀第一件事，才不會跟本幀新畫的東西攪在一起。
+        self.retired.sweep();
+
         // 把實際的 GPU 貼圖上限告訴解碼執行緒（egui 在第一幀後才知道真值）
         let side = ctx.input(|i| i.max_texture_side) as u32;
         if cfg!(debug_assertions) && side != crate::loader::max_tex_side() {
@@ -2058,6 +2074,11 @@ impl eframe::App for ViewerApp {
         self.filmstrip(ctx);
         self.info_window(ctx);
         self.about_window(ctx);
+
+        // 有圖等著釋放就要再來一幀，否則貼圖會一直佔著 VRAM 直到下次互動
+        if !self.retired.is_empty() {
+            ctx.request_repaint();
+        }
     }
 }
 

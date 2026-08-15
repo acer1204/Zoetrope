@@ -1,6 +1,7 @@
 pub mod app;
 pub mod appicon;
 pub mod cache;
+pub mod deferred;
 pub mod dirlist;
 pub mod extra_formats;
 pub mod hdr;
