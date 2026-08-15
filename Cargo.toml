@@ -1,6 +1,6 @@
 [package]
 name = "zoetrope"
-version = "1.2.3"
+version = "1.3.0"
 edition = "2021"
 description = "走馬燈 — 極速跨平台看圖軟體：GPU 渲染、串流動畫解碼、資料夾惰性載入"
 license = "AGPL-3.0-only"
