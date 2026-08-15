@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    install_crash_log();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
@@ -53,6 +54,36 @@ fn main() -> eframe::Result {
             )))
         }),
     )
+}
+
+/// 當機記錄的存放位置。放在暫存目錄而不是執行檔旁邊——程式可能被裝在
+/// Program Files 這種沒有寫入權限的地方。
+fn crash_log_path() -> PathBuf {
+    std::env::temp_dir().join("zoetrope-crash.log")
+}
+
+/// 把 panic 訊息寫進檔案。
+///
+/// 發行版是 GUI 子系統（`windows_subsystem = "windows"`），沒有主控台，
+/// panic 訊息會直接消失，使用者只看得到「閃退」，回報時也拿不出任何線索。
+/// 訊息本身與 `檔案:行號` 即使在 strip 過的執行檔裡也還在，通常就足以定位。
+fn install_crash_log() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // 這裡面絕對不能再 panic，所有錯誤一律忽略
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(crash_log_path())
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "==== Zoetrope {} ====", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(f, "{info}");
+            let _ = writeln!(f, "{}", std::backtrace::Backtrace::force_capture());
+            let _ = writeln!(f);
+        }
+        prev(info);
+    }));
 }
 
 /// 載入系統 CJK 字型，讓中文檔名與介面正常顯示（egui 內建字型不含漢字）

@@ -13,7 +13,10 @@ fn tmp() -> std::path::PathBuf {
     d
 }
 
-/// 產生一張有明確亮度階梯的 EXR：從 0.01 到 64.0，橫跨 12 個 stop
+/// 產生一張有明確亮度階梯的 EXR：從 0.01 到 64.0，橫跨 12 個 stop。
+///
+/// 檔名帶上尺寸——測試是平行跑的，而同一個執行檔裡 PID 相同，
+/// 共用檔名會讓一個測試讀到另一個測試寫到一半的檔案。
 fn make_exr(dir: &std::path::Path, w: u32, h: u32) -> std::path::PathBuf {
     let img = image::Rgb32FImage::from_fn(w, h, |x, _| {
         // 每一欄一個亮度，指數分布
@@ -21,7 +24,7 @@ fn make_exr(dir: &std::path::Path, w: u32, h: u32) -> std::path::PathBuf {
         let v = 0.01f32 * (64.0f32 / 0.01).powf(t);
         image::Rgb([v, v, v])
     });
-    let p = dir.join("steps.exr");
+    let p = dir.join(format!("steps-{w}x{h}.exr"));
     image::DynamicImage::ImageRgb32F(img)
         .save_with_format(&p, image::ImageFormat::OpenExr)
         .unwrap();
